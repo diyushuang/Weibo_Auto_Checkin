@@ -69,7 +69,7 @@ docker run -d --name weibo-checkin --restart unless-stopped \
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/health  # 期望 200
 ```
 
-> GitHub Actions 会在推送 tag 时自动构建 Docker Hub 多架构镜像（**linux/amd64 + linux/arm64**，x86 服务器、树莓派、ARM 云主机均可直接 `docker pull`），版本号与 Git tag 一致（如 `v1.3.2`），`latest` 永远指向最新。
+> GitHub Actions 会在推送 tag 时自动构建 Docker Hub 多架构镜像（**linux/amd64 + linux/arm64**，x86 服务器、树莓派、ARM 云主机均可直接 `docker pull`），版本号与 Git tag 一致（如 `v1.3.3`），`latest` 永远指向最新。
 
 ## 🛠️ 开发者：本地构建 / 发布
 
@@ -84,8 +84,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 发布：推送 tag 触发 GitHub Actions 自动构建多架构 Docker Hub 镜像（见 `.github/workflows/build-docker.yml`）。
 
 ```bash
-git tag v1.3.2
-git push origin v1.3.2   # 自动触发 Docker Hub 构建（amd64 + arm64）
+git tag v1.3.3
+git push origin v1.3.3   # 自动触发 Docker Hub 构建（amd64 + arm64）
 ```
 
 本地 Docker 构建：
