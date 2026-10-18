@@ -23,7 +23,7 @@
 
 ```bash
 # 下载脚本后运行
-curl -o install.sh https://raw.githubusercontent.com/kaoqy/Weibo_Auto_Checkin/main/install.sh
+curl -o install.sh https://raw.githubusercontent.com/diyushuang/Weibo_Auto_Checkin/main/install.sh
 chmod +x install.sh
 bash install.sh            # 默认端口 8000
 bash install.sh 8080       # 指定端口
@@ -146,6 +146,17 @@ weibo-checkin-manager/
 └── tests/
 ```
 
+## 🙏 致谢
+
+本项目基于原作者 [kaoqy/Weibo_Auto_Checkin](https://github.com/kaoqy/Weibo_Auto_Checkin) fork 并持续改进，感谢原作者的开源贡献。原项目的 MIT 授权允许自由使用、修改与再分发，本项目遵循相同协议继续开源。
+
+本 fork 的主要增强：
+
+| 版本 | 主要内容 |
+|---|---|
+| [v1.3.2](https://github.com/diyushuang/Weibo_Auto_Checkin/releases/tag/v1.3.2) | 安全加固（登录限流、PBKDF2 口令哈希、SSRF 守卫与响应脱敏）、Cookie 健康度体系（到期预警 / 保活续期 / 轮换记录）、主题美化 |
+| [v1.3.3](https://github.com/diyushuang/Weibo_Auto_Checkin/releases/tag/v1.3.3) | WebUI 设计令牌化重构（统一间距 / 字阶 / 圆角体系）、设置页与仪表盘布局重组、组件精修与响应式优化 |
+
 ## 📄 License
 
-MIT
+本项目采用 [MIT License](LICENSE) 开源。版权声明同时保留原项目作者（kaoqy）与本仓库维护者（diyushuang）的署名，fork 后的修改部分同样以 MIT 协议发布。
