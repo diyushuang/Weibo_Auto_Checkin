@@ -11,7 +11,17 @@ from datetime import datetime
 
 from . import database
 
-log = logging.getLogger("weibo.antibab")
+log = logging.getLogger("weibo.antiban")
+
+
+def _int_setting(key: str, default: int) -> int:
+    """读取整型设置，值损坏时回退默认值。"""
+    raw = database.get_setting(key, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning("设置 %s 值 %r 不是数字，回退默认 %d", key, raw, default)
+        return default
 
 
 class AntiBanPolicy:
@@ -28,9 +38,9 @@ class AntiBanPolicy:
     def from_settings(cls) -> "AntiBanPolicy":
         return cls(
             enabled=database.get_setting("anti_ban_enabled", "1") == "1",
-            wait_min=int(database.get_setting("anti_ban_wait_min", "120") or 120),
-            wait_max=int(database.get_setting("anti_ban_wait_max", "300") or 300),
-            window_hour=int(database.get_setting("anti_ban_window_hour", "7") or 7),
+            wait_min=_int_setting("anti_ban_wait_min", 120),
+            wait_max=_int_setting("anti_ban_wait_max", 300),
+            window_hour=_int_setting("anti_ban_window_hour", 7),
         )
 
     def in_window(self) -> bool:

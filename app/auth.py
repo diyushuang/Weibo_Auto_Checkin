@@ -8,8 +8,6 @@ import hashlib
 import hmac
 import os
 import secrets
-import threading
-import time
 from datetime import datetime
 
 from fastapi import Depends, HTTPException, Request
@@ -74,16 +72,18 @@ def auth_enabled() -> bool:
 # ========================= Cookie 安全（v7.2） =========================
 
 def is_secure_request(request: Request) -> bool:
-    """判断当前请求是否走 HTTPS（含反向代理场景）。
+    """判断当前请求是否走 HTTPS。
 
-    面板通常部署在 nginx/openresty 反代后面，应用自己看到的是明文 HTTP，
-    必须靠 `X-Forwarded-Proto` 判断真实协议，否则永远加不上 Secure 标记。
+    仅在 WCM_TRUST_PROXY=1（可信反代）时采信 `X-Forwarded-Proto`，
+    否则以应用自身看到的 scheme 为准——直连场景下该头可被伪造。
+    反代部署请设置 WCM_TRUST_PROXY=1，否则 Secure 标记不会生效。
     """
-    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-    if proto:
-        return proto == "https"
-    if (request.headers.get("x-forwarded-ssl") or "").lower() == "on":
-        return True
+    if _trust_proxy_headers():
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+        if (request.headers.get("x-forwarded-ssl") or "").lower() == "on":
+            return True
     return request.url.scheme == "https"
 
 
@@ -102,59 +102,54 @@ def set_session_cookie(response, token: str, request: Request | None = None) -> 
     )
 
 
-# ========================= 登录失败限流（v7.2） =========================
+# ========================= 登录失败限流（v7.2，状态落库见 database.py） =========================
 
 LOGIN_MAX_FAILS = 5           # 窗口内允许的失败次数
 LOGIN_WINDOW_SECONDS = 300    # 统计窗口
 LOGIN_LOCK_SECONDS = 300      # 触发后锁定时长
 
-_login_fails: dict[str, list[float]] = {}
-_login_locks: dict[str, float] = {}
-_login_lock_guard = threading.Lock()
+
+def _trust_proxy_headers() -> bool:
+    """仅在显式配置 WCM_TRUST_PROXY=1 时信任反代头（X-Forwarded-For 等）。
+
+    面板直连暴露时，XFF 可被任意伪造——默认信任等于给爆破者免费换 IP。
+    部署在 nginx 等可信反代后的用户请设置该环境变量。
+    """
+    return os.environ.get("WCM_TRUST_PROXY", "").strip().lower() in ("1", "true", "yes")
 
 
 def client_ip(request: Request) -> str:
-    """取真实客户端 IP（反代场景下用 X-Forwarded-For 第一段）。"""
-    xff = request.headers.get("x-forwarded-for") or ""
-    if xff:
-        return xff.split(",")[0].strip()
-    real = request.headers.get("x-real-ip")
-    if real:
-        return real.strip()
+    """取真实客户端 IP：可信反代场景取 X-Forwarded-For 第一段，否则取直连地址。"""
+    if _trust_proxy_headers():
+        xff = request.headers.get("x-forwarded-for") or ""
+        if xff:
+            return xff.split(",")[0].strip()
+        real = request.headers.get("x-real-ip")
+        if real:
+            return real.strip()
     return request.client.host if request.client else "unknown"
 
 
 def login_lock_remaining(ip: str) -> int:
-    """该 IP 剩余锁定秒数；0 表示未锁定。"""
-    now = time.time()
-    with _login_lock_guard:
-        until = _login_locks.get(ip, 0)
-        if until > now:
-            return int(until - now) + 1
-        if until:
-            _login_locks.pop(ip, None)
-    return 0
+    """该 IP 剩余锁定秒数；0 表示未锁定。状态存 SQLite，重启/多进程共享。"""
+    return database.login_lock_remaining(ip, LOGIN_LOCK_SECONDS)
 
 
 def record_login_failure(ip: str) -> int:
     """记录一次登录失败；触发锁定则返回锁定秒数，否则 0。"""
-    now = time.time()
-    with _login_lock_guard:
-        hits = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
-        hits.append(now)
-        _login_fails[ip] = hits
-        if len(hits) >= LOGIN_MAX_FAILS:
-            _login_locks[ip] = now + LOGIN_LOCK_SECONDS
-            _login_fails[ip] = []
-            return LOGIN_LOCK_SECONDS
-    return 0
+    return database.record_login_failure(
+        ip, LOGIN_MAX_FAILS, LOGIN_WINDOW_SECONDS, LOGIN_LOCK_SECONDS
+    )
 
 
 def reset_login_failures(ip: str) -> None:
     """登录成功后清掉该 IP 的失败计数。"""
-    with _login_lock_guard:
-        _login_fails.pop(ip, None)
-        _login_locks.pop(ip, None)
+    database.reset_login_failures(ip)
+
+
+def reset_login_limits() -> None:
+    """清空全部登录限流状态（测试/运维用）。"""
+    database.reset_all_login_locks()
 
 
 # ========================= FastAPI 依赖 =========================

@@ -69,8 +69,12 @@ services:
       - TZ=Asia/Shanghai
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
+      - WCM_TRUST_PROXY=${WCM_TRUST_PROXY:-0}
     volumes:
       - ${DATA_DIR}:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
@@ -126,6 +130,7 @@ do_install() {
   ok ""
   ok "=================================================="
   ok "  部署完成！"
+  ok "  系统架构: $(uname -m)（镜像自动匹配 amd64/arm64）"
   ok "  管理面板:  http://<服务器IP>:${PORT}"
   ok ""
   ok "  首次访问会进入「初始化」页面，请设置管理员账号密码。"

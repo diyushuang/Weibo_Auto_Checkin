@@ -69,7 +69,7 @@ docker run -d --name weibo-checkin --restart unless-stopped \
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/health  # 期望 200
 ```
 
-> GitHub Actions 会在推送 tag 时自动构建 Docker Hub 镜像，版本号与 Git tag 一致（如 `v1.3.0`），`latest` 永远指向最新。
+> GitHub Actions 会在推送 tag 时自动构建 Docker Hub 多架构镜像（**linux/amd64 + linux/arm64**，x86 服务器、树莓派、ARM 云主机均可直接 `docker pull`），版本号与 Git tag 一致（如 `v1.3.2`），`latest` 永远指向最新。
 
 ## 🛠️ 开发者：本地构建 / 发布
 
@@ -81,11 +81,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python run.py checkin  # 命令行跑一次签到
 ```
 
-发布：推送 tag 触发 GitHub Actions 自动构建 Docker Hub 镜像（见 `.github/workflows/build-docker.yml`）。
+发布：推送 tag 触发 GitHub Actions 自动构建多架构 Docker Hub 镜像（见 `.github/workflows/build-docker.yml`）。
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0   # 自动触发 Docker Hub 构建
+git tag v1.3.2
+git push origin v1.3.2   # 自动触发 Docker Hub 构建（amd64 + arm64）
 ```
 
 本地 Docker 构建：
@@ -93,9 +93,10 @@ git push origin v1.3.0   # 自动触发 Docker Hub 构建
 ```bash
 docker build -t weibo-checkin:latest .
 docker compose up -d --build
-```
 
-发布：推送 tag 触发 GitHub Actions 自动构建 Docker Hub 镜像（见 `.github/workflows/build-docker.yml`）。
+# 本地验证多架构构建（arm64 走 QEMU，较慢）
+docker buildx build --platform linux/amd64,linux/arm64 -t weibo-checkin:multi .
+```
 
 ## 🎯 使用
 
@@ -109,14 +110,18 @@ docker compose up -d --build
 
 ## 🔒 安全
 
-- 登录保护默认开启；密码 PBKDF2 哈希存储
+- 登录保护默认开启；密码 PBKDF2 哈希存储；会话 token 仅存摘要；登录限流持久化（5 次/5 分钟锁定 5 分钟）
+- 数据目录仅暴露头像子目录，数据库文件不可经 HTTP 下载
+- 出站请求有 SSRF 守卫：微博返回的链接限定微博域名，拒绝本地/私有/保留地址
+- 代理凭据、Bot Token 不出现在日志、数据库错误消息与 TG 通知中
 - Cookie 存本地 SQLite，勿公开 `data/` 目录
-- 建议反向代理 + HTTPS 访问
+- 建议反向代理 + HTTPS 访问；反代部署请设 `WCM_TRUST_PROXY=1`（否则应用不采信 `X-Forwarded-*`，见 `.env.example`）
+- 完整审计报告见 [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)（v1.3.1 全量安全加固）
 
 ## 🧪 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -v   # 57 个测试
+.venv/bin/python -m pytest tests/ -v   # 172 个测试
 node tests/frontend-render.test.js      # 前端渲染测试（自动装 jsdom）
 ```
 
@@ -127,15 +132,17 @@ weibo-checkin-manager/
 ├── run.py            # 本地启动
 ├── install.sh        # 用户一键安装/更新/管理（推荐）
 ├── compose.prod.yml  # 生产 compose（仅拉镜像运行）
-├── Dockerfile
+├── Dockerfile        # 多阶段构建（amd64/arm64，非 root 运行）
 ├── app/              # 后端 + 前端
-│   ├── main.py       # FastAPI 入口 + 认证中间件
+│   ├── main.py       # FastAPI 入口 + 认证中间件 + 安全响应头
+│   ├── security.py   # 凭据脱敏 + SSRF 出站守卫
 │   ├── weibo_client.py
-│   ├── proxy_geo.py  # SOCKS5 代理归属地识别
+│   ├── proxy_geo.py  # SOCKS5 代理归属地识别（HTTPS 服务并发探测）
 │   ├── scheduler.py  # 定时 + 防封 + 分组并行调度
 │   ├── notifier.py   # TG 推送
-│   ├── api/          # accounts / proxies / tasks / auth
+│   ├── api/          # accounts / proxies / tasks / auth / topics
 │   └── static/       # 前端页面（含代理管理页）
+├── docs/SECURITY_AUDIT.md  # 安全审计报告
 └── tests/
 ```
 

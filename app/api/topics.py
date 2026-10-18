@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from pathlib import Path
 from urllib.parse import quote as escape
 
@@ -12,8 +13,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .. import auth, database
+from .. import auth, database, security
+from ..security import safe_exc
 from ..weibo_client import (
+    CheckinOptions,
     fetch_topic_posts,
     get_followed_topics,
     normalize_cookie,
@@ -36,6 +39,10 @@ def call_ai_summary(text: str, topic_name: str = "超话", stream: bool = False)
 
     if not base_url or not api_key:
         return {"ok": False, "summary": "", "error": "未配置 AI 总结功能"}
+    try:
+        base_url = security.validate_ai_base_url(base_url)
+    except security.UnsafeURLError as exc:
+        return {"ok": False, "summary": "", "error": str(exc)}
 
     truncated_text = text[:8000] if len(text) > 8000 else text
     system_content = AI_TOPIC_PROMPT.replace("{topic_name}", topic_name)
@@ -76,7 +83,7 @@ def call_ai_summary(text: str, topic_name: str = "超话", stream: bool = False)
     except requests.exceptions.Timeout:
         return {"ok": False, "summary": "", "error": "请求超时"}
     except Exception as exc:
-        return {"ok": False, "summary": "", "error": f"调用失败：{exc}"}
+        return {"ok": False, "summary": "", "error": f"调用失败：{safe_exc(exc)}"}
 
 
 router = APIRouter(prefix="/api/topics", tags=["topics"])
@@ -123,35 +130,90 @@ AI_TOPIC_PROMPT = """你是微博「{topic_name}」超话的内容分析助手�
 - 直接从「## 📋 内容概览」开始输出，不要开场白和结尾客套"""
 
 
+# 新浪图床防盗链对不同请求头组合的放行规则不一致（对数据中心/海外 IP 更严格，
+# 且出现"有 UA 但无 Referer"即 403），因此 403/429 时按序切换请求头重试。
+_IMG_HEADER_STRATEGIES = (
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        ),
+        "Referer": "https://m.weibo.cn/",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Referer": "https://weibo.com/",
+    },
+    # 裸请求（无 UA、无 Referer）通常直接放行
+    {},
+)
+
+# 同一张图的字节在任意 wx* 节点/尺寸节点都可用，403 时可换尺寸兜底
+_SINAIMG_SIZE_RE = re.compile(r"^(https?://wx\d+\.sinaimg\.cn/)([a-z0-9]+)/(.+)$", re.IGNORECASE)
+# 下载成功后扩展名按 magic bytes 重算，缓存命中需逐个候选尝试
+_IMG_CACHE_EXTS = (".jpg", ".png", ".webp", ".gif", ".bmp")
+
+
+def _fetch_image_bytes(url: str) -> bytes | None:
+    """依次用多组请求头下载；403/429 切换下一组，其他错误直接放弃。"""
+    for headers in _IMG_HEADER_STRATEGIES:
+        try:
+            resp = requests.get(url, timeout=15, headers=headers)
+        except Exception as exc:
+            log.warning("图片下载失败 %s: %s", url[:80], safe_exc(exc))
+            return None
+        if resp.status_code in (403, 429):
+            continue
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            log.warning("图片下载失败 %s: %s", url[:80], safe_exc(exc))
+            return None
+        content = resp.content
+        if len(content) < 100:
+            return None
+        return content
+    log.warning("图片下载失败 %s: 图床拒绝访问，多组请求头均被拦截", url[:80])
+    return None
+
+
 def _download_image(url: str) -> Path | None:
     if not url or not url.startswith(("http://", "https://")):
         return None
+    try:
+        url = security.validate_outbound_url(url)
+    except security.UnsafeURLError:
+        return None
     url_hash = hashlib.md5(url.encode()).hexdigest()
+    for e in _IMG_CACHE_EXTS:
+        cached = IMG_CACHE_DIR / f"{url_hash}{e}"
+        if cached.exists() and cached.stat().st_size > 0:
+            return cached
     ext = ".jpg"
     lower = url.lower()
     for e in (".png", ".webp", ".gif", ".bmp"):
         if e in lower:
             ext = e
             break
-    local_path = IMG_CACHE_DIR / f"{url_hash}{ext}"
-    if local_path.exists() and local_path.stat().st_size > 0:
-        return local_path
-    try:
-        resp = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://m.weibo.cn/",
-        })
-        resp.raise_for_status()
-        content = resp.content
-        if len(content) < 100:
-            return None
-        ext = _detect_image_ext(content) or ext
-        local_path = IMG_CACHE_DIR / f"{url_hash}{ext}"
-        local_path.write_bytes(content)
-        return local_path
-    except Exception as exc:
-        log.warning("图片下载失败 %s: %s", url[:80], exc)
-        return None
+
+    candidates = [url]
+    size_match = _SINAIMG_SIZE_RE.match(url)
+    # thumbnail 等小尺寸节点风控更严，换 orj480/mw690 兜底
+    if size_match and size_match.group(2) not in ("orj480", "mw690"):
+        candidates.append(f"{size_match.group(1)}orj480/{size_match.group(3)}")
+        candidates.append(f"{size_match.group(1)}mw690/{size_match.group(3)}")
+
+    for candidate in candidates:
+        content = _fetch_image_bytes(candidate)
+        if content is not None:
+            ext = _detect_image_ext(content) or ext
+            local_path = IMG_CACHE_DIR / f"{url_hash}{ext}"
+            local_path.write_bytes(content)
+            return local_path
+    return None
 
 
 # ========================= 单账号关注超话缓存 =========================
@@ -196,18 +258,8 @@ def refresh_topics(data: RefreshIn, user=Depends(auth.require_admin)):
     if not cookie:
         raise HTTPException(400, "账号 Cookie 为空")
 
-    import requests as _req
-    session = _req.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
-        "Referer": "https://m.weibo.cn/",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "MWeibo-Pwa": "1",
-    })
+    from ..weibo_client import new_account_session
+    session = new_account_session()
 
     proxy = (acc.get("proxy") or "").strip() or None
     channel = "socks" if proxy else "direct"
@@ -221,7 +273,9 @@ def refresh_topics(data: RefreshIn, user=Depends(auth.require_admin)):
             force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
         )
     except Exception as exc:
+        _persist_account_cookie(acc, session, cookie)
         raise HTTPException(502, f"获取超话列表失败：{exc}") from exc
+    _persist_account_cookie(acc, session, cookie)
 
     for t in topics:
         cid = t.get("id", "")
@@ -271,18 +325,8 @@ def refresh_all_topics(user=Depends(auth.require_admin)):
             continue
 
         try:
-            import requests as _req
-            session = _req.Session()
-            session.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-                ),
-                "Referer": "https://m.weibo.cn/",
-                "Accept": "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-                "MWeibo-Pwa": "1",
-            })
+            from ..weibo_client import new_account_session
+            session = new_account_session()
 
             proxy = (acc.get("proxy") or "").strip() or None
             channel = "socks" if proxy else "direct"
@@ -294,6 +338,7 @@ def refresh_all_topics(user=Depends(auth.require_admin)):
                 session, cookie, channel=channel, proxy=proxy,
                 force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
             )
+            _persist_account_cookie(acc, session, cookie)
 
             for t in topics:
                 cid = t.get("id", "")
@@ -382,12 +427,43 @@ def get_cached_posts(topic_id: str, user=Depends(auth.require_admin)):
 
 # ========================= 超话内容拉取 =========================
 
+def _posts_session() -> requests.Session:
+    """超话帖子拉取的移动端会话（账号专属 jar，便于回收换发到的 Set-Cookie）。"""
+    from ..weibo_client import new_account_session
+    return new_account_session()
+
+
+def _persist_account_cookie(acc: dict, session, cookie: dict) -> None:
+    """回写这次请求换发到的 cookie；任何失败都不能影响帖子本身。"""
+    try:
+        from ..scheduler import get_account_lock, persist_refreshed_cookie
+        with get_account_lock(acc["id"]):
+            persist_refreshed_cookie(acc["id"], session, cookie)
+    except Exception as exc:
+        log.warning("账号 %s cookie 续期回写失败：%s", acc.get("name", ""), safe_exc(exc))
+
+
+def _rewrite_post_media(posts: list) -> None:
+    """帖子图片与头像改走本站图片代理，避免微博图床防盗链影响显示。"""
+    for p in posts:
+        if p.get("pics"):
+            p["pics"] = [
+                f"/api/topics/img?url={escape(url)}" if url.startswith(("http://", "https://")) else url
+                for url in p["pics"]
+            ]
+        user_obj = p.get("user", {})
+        avatar = user_obj.get("profile_image_url", "")
+        if avatar.startswith(("http://", "https://")):
+            user_obj["profile_image_url"] = f"/api/topics/img?url={escape(avatar)}"
+
+
 @router.get("/posts/{topic_id}")
 def get_topic_posts(topic_id: str, count: int = 20,
                     force: bool = False, user=Depends(auth.require_admin)):
     """拉取指定超话的最新帖子。
     默认使用缓存（cache-first），force=true 时强制刷新。
-    微博超话帖子接口是公开的，不需要登录态。
+    微博已收紧匿名访问（getIndex 匿名返回 -100/432）：优先用已登录账号的
+    Cookie 拉取（与签到后自动刷新同一方式），无账号或全部失败时才匿名尝试。
     """
     # Cache-first: return cached data unless force=true
     if not force:
@@ -405,40 +481,65 @@ def get_topic_posts(topic_id: str, count: int = 20,
                 "fetched_at": cached.get("fetched_at", ""),
             }
 
-    # 创建无 Cookie 的公开请求会话
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
-        "Referer": "https://m.weibo.cn/",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "MWeibo-Pwa": "1",
-    })
+    opts = CheckinOptions.from_settings(database.get_setting)
+    limit = min(count, 50)
+    errors: list[str] = []
 
-    # 尝试用账号的代理（如果有），但不需要 Cookie
-    accounts = database.get_accounts()
+    def _finish(posts: list, acc: dict | None):
+        _rewrite_post_media(posts)
+        database.set_topic_posts_cache(topic_id, posts)
+        # 只给已收录的超话更新抓取时间；未收录时不建空记录（否则列表会出现无名条目）
+        if database.get_all_topic(topic_id):
+            database.upsert_all_topic(topic_id=topic_id, fetched_at=database._now())
+        return {
+            "ok": True,
+            "topic_id": topic_id,
+            "account_used": (acc or {}).get("id", 0),
+            "account_name": (acc or {}).get("name", "") or "公开访问",
+            "posts": posts,
+            "count": len(posts),
+            "error": "",
+            "cached": False,
+        }
+
+    def _attempt(session, cookies, acc):
+        proxy = ((acc or {}).get("proxy") or "").strip() or None
+        return fetch_topic_posts(
+            session, cookies=cookies, containerid=topic_id,
+            channel="socks" if proxy else "direct", proxy=proxy,
+            force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
+            count=limit,
+        )
+
+    # 1) 已登录账号的 Cookie：轮询到有 Cookie 的账号为止（最多试 3 个）
+    for acc in database.get_accounts():
+        cookie = normalize_cookie(acc.get("cookie") or acc.get("cookie_raw") or "")
+        if not cookie:
+            continue
+        session = _posts_session()
+        try:
+            result = _attempt(session, cookie, acc)
+        except Exception as exc:
+            _persist_account_cookie(acc, session, cookie)
+            errors.append(f"账号[{acc.get('name', '')}] {safe_exc(exc)}")
+            continue
+        # 带 cookie 的请求同样会轮换 SUB，收走回写，别把新凭证扔了继续用旧的
+        _persist_account_cookie(acc, session, cookie)
+        if result.get("posts"):
+            return _finish(result["posts"], acc)
+        errors.append(f"账号[{acc.get('name', '')}] {result.get('error', '') or '未获取到帖子'}")
+        if len(errors) >= 3:
+            break
+
+    # 2) 匿名回退（无账号或账号 Cookie 都失败时；代理沿用账号配置）
     proxy = None
-    channel = "direct"
-    for acc in accounts:
+    for acc in database.get_accounts():
         proxy_url = (acc.get("proxy") or "").strip()
         if proxy_url.startswith(("socks5://", "socks5h://")):
             proxy = proxy_url
-            channel = "socks"
             break
-
-    from ..weibo_client import CheckinOptions
-    opts = CheckinOptions.from_settings(database.get_setting)
-
     try:
-        result = fetch_topic_posts(
-            session, cookies={}, containerid=topic_id,
-            channel=channel, proxy=proxy,
-            force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
-            count=min(count, 50),
-        )
+        result = _attempt(_posts_session(), {}, None)
     except Exception as exc:
         return {
             "ok": True,
@@ -447,38 +548,11 @@ def get_topic_posts(topic_id: str, count: int = 20,
             "account_name": "",
             "posts": [],
             "count": 0,
-            "error": f"拉取失败：{exc}",
+            "error": f"拉取失败：{safe_exc(exc)}",
         }
-
     if result.get("posts"):
-        posts = result["posts"]
-        for p in posts:
-            if p.get("pics"):
-                p["pics"] = [
-                    f"/api/topics/img?url={escape(url)}" if url.startswith(("http://", "https://")) else url
-                    for url in p["pics"]
-                ]
-            user_obj = p.get("user", {})
-            avatar = user_obj.get("profile_image_url", "")
-            if avatar.startswith(("http://", "https://")):
-                user_obj["profile_image_url"] = f"/api/topics/img?url={escape(avatar)}"
-
-        database.set_topic_posts_cache(topic_id, posts)
-        # 只给已收录的超话更新抓取时间；未收录时不建空记录（否则列表会出现无名条目）
-        if database.get_all_topic(topic_id):
-            database.upsert_all_topic(topic_id=topic_id, fetched_at=database._now())
-
-        return {
-            "ok": True,
-            "topic_id": topic_id,
-            "account_used": 0,
-            "account_name": "公开访问",
-            "posts": posts,
-            "count": len(posts),
-            "error": "",
-            "cached": False,
-        }
-
+        return _finish(result["posts"], None)
+    errors.append(result.get("error", "未获取到帖子"))
     return {
         "ok": True,
         "topic_id": topic_id,
@@ -486,7 +560,7 @@ def get_topic_posts(topic_id: str, count: int = 20,
         "account_name": "",
         "posts": [],
         "count": 0,
-        "error": result.get("error", "未获取到帖子"),
+        "error": "; ".join(errors),
     }
 
 
@@ -506,8 +580,8 @@ def refresh_posts(topic_id: str, data: RefreshPostsIn,
 # ========================= 图片代理 =========================
 
 @router.get("/img")
-def proxy_image(url: str):
-    """代理下载图片"""
+def proxy_image(url: str, user: dict = Depends(auth.require_admin)):
+    """代理下载图片（SSRF 守卫：仅 http/https，拒绝本地/私有/保留地址）。"""
     if not url:
         raise HTTPException(400, "url 为空")
     try:
@@ -515,6 +589,10 @@ def proxy_image(url: str):
         url = unquote(url)
     except Exception:
         pass
+    try:
+        url = security.validate_outbound_url(url)
+    except security.UnsafeURLError as exc:
+        raise HTTPException(400, f"不允许的图片地址：{exc}")
     local_path = _download_image(url)
     if not local_path or not local_path.exists():
         raise HTTPException(404, "图片获取失败")
@@ -534,6 +612,7 @@ class AISummaryIn(BaseModel):
     text: str
     topic_name: str = "超话"
     stream: bool = False
+    question: str = ""  # 非空时进入 Q&A 模式：帖子内容作上下文，问题作为提问
 
 
 @router.post("/ai_summary")
@@ -549,16 +628,33 @@ def ai_summary(data: AISummaryIn, user=Depends(auth.require_admin)):
             "summary": "",
             "error": "未配置 AI 总结功能。请在设置中填写 API Base URL 和 API Key。",
         }
+    try:
+        base_url = security.validate_ai_base_url(base_url)
+    except security.UnsafeURLError as exc:
+        return {"ok": False, "summary": "", "error": str(exc)}
 
     truncated_text = data.text[:8000] if len(data.text) > 8000 else data.text
 
-    # 总结模式：结构化总结
-    system_content = AI_TOPIC_PROMPT.replace("{topic_name}", data.topic_name)
-    user_content = f"以下是「{data.topic_name}」超话的最新帖子内容：\n\n{truncated_text}"
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
-    ]
+    # Q&A 模式：帖子内容进 system 上下文，用户问题作为 user 消息；
+    # 总结模式：结构化总结提示词 + 帖子内容。
+    qa_mode = bool(data.question.strip())
+    if qa_mode:
+        system_content = (
+            f"你是微博「{data.topic_name}」超话的内容分析助手。"
+            f"以下是与该超话相关的最新帖子内容，请据此回答用户的问题，"
+            f"只依据所给内容，不要编造。\n\n{truncated_text}"
+        )
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": data.question.strip()},
+        ]
+    else:
+        system_content = AI_TOPIC_PROMPT.replace("{topic_name}", data.topic_name)
+        user_content = f"以下是「{data.topic_name}」超话的最新帖子内容：\n\n{truncated_text}"
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
 
     payload = {
         "model": model,
@@ -665,13 +761,14 @@ def ai_summary(data: AISummaryIn, user=Depends(auth.require_admin)):
                 "ok": True,
                 "summary": summary,
                 "model": result.get("model", model),
+                "qa_mode": qa_mode,
             }
             return out
     except requests.exceptions.Timeout:
         return {"ok": False, "summary": "", "error": "请求超时，请稍后重试"}
     except Exception as exc:
-        log.error("AI 总结失败: %s", exc)
-        return {"ok": False, "summary": "", "error": f"调用失败：{exc}"}
+        log.error("AI 总结失败: %s", safe_exc(exc))
+        return {"ok": False, "summary": "", "error": f"调用失败：{safe_exc(exc)}"}
 
 
 # ========================= TG 推送超话摘要 =========================
@@ -690,6 +787,10 @@ def push_topic_summary(data: TopicSummaryPushIn, user=Depends(auth.require_admin
 
     if not base_url or not api_key:
         return {"ok": False, "error": "未配置 AI 总结功能"}
+    try:
+        base_url = security.validate_ai_base_url(base_url)
+    except security.UnsafeURLError as exc:
+        return {"ok": False, "error": str(exc)}
 
     truncated_text = data.text[:8000] if len(data.text) > 8000 else data.text
 
@@ -732,5 +833,5 @@ def push_topic_summary(data: TopicSummaryPushIn, user=Depends(auth.require_admin
 
         return {"ok": True, "summary": summary}
     except Exception as exc:
-        log.error("推送超话摘要失败: %s", exc)
-        return {"ok": False, "error": f"推送失败：{exc}"}
+        log.error("推送超话摘要失败: %s", safe_exc(exc))
+        return {"ok": False, "error": f"推送失败：{safe_exc(exc)}"}

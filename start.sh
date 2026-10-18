@@ -23,7 +23,7 @@ fi
 
 # 2. 安装依赖
 echo "▶ 安装依赖..."
-"$PY" -m pip install -q -r requirements.txt 2>/dev/null || true
+"$PY" -m pip install -q -r requirements.txt
 
 # 3. 启动
 HOST="${HOST:-0.0.0.0}"

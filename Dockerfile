@@ -3,6 +3,7 @@
 # 微博超话签到管理面板 · 多阶段构建
 #   阶段1 build: 创建 venv 并安装依赖
 #   阶段2 runtime: 精简运行镜像（仅保留 venv + 代码）
+# 支持架构：linux/amd64 + linux/arm64（所有依赖均有 aarch64 wheel）
 # ============================================================
 
 # ---------- 阶段1：构建依赖 ----------
@@ -10,15 +11,13 @@ FROM python:3.11-slim AS build
 
 WORKDIR /build
 
-# 安装编译工具（仅构建时需要；若某些 wheel 无预编译则需 gcc）
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc g++ build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
+# 依赖全部有预编译 wheel（pydantic-core/uvloop/httptools 等），
+# PIP_ONLY_BINARY=:all: 作为护栏：将来引入无 wheel 的依赖会立刻报错，
+# 而不是在 QEMU 交叉构建里用 gcc 慢慢编译。
 COPY requirements.txt .
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+    && PIP_ONLY_BINARY=:all: /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ---------- 阶段2：运行 ----------
 FROM python:3.11-slim AS runtime
@@ -44,9 +43,6 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN /opt/venv/bin/pip uninstall -y pip setuptools 2>/dev/null || true \
     && find /opt/venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# 强制重新构建（确保修复生效）
-RUN echo "Build timestamp: $(date)" > /build-info.txt
-
 # 扫码登录使用纯 requests 实现，无需安装浏览器或浏览器运行库。
 WORKDIR /app
 
@@ -55,8 +51,11 @@ COPY run.py .
 COPY start.sh .
 COPY app/ ./app/
 
-# 数据目录（数据库持久化挂载点）
-RUN mkdir -p /app/data
+# 数据目录（数据库持久化挂载点），归属非 root 运行用户
+RUN mkdir -p /app/data \
+    && useradd --create-home --uid 10001 wcm \
+    && chown -R wcm:wcm /app
+USER wcm
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

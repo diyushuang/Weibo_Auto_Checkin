@@ -3,13 +3,14 @@ SOCKS5 代理归属地识别。
 通过每个 socks 代理发起 IP 定位请求，自动识别归属地（国家/地区）。
 
 v7.2 修订（实测校准，非推测）：
-- **HTTPS 接口优先**。实测部分 SOCKS 出口会劫持明文 HTTP：请求
+- **仅用 HTTPS 接口**。实测部分 SOCKS 出口会劫持明文 HTTP：请求
   `http://ip-api.com/json/` 会拿到一个 HTML 门户页而不是 JSON，于是识别结果
-  忽成功忽失败。HTTPS 不会被中间层改写，所以放前面，明文 HTTP 只作兜底。
+  忽成功忽失败。明文 HTTP 兜底接口已移除（v1.3.1），全部改为 HTTPS。
 - **统一中文地名**。以前多服务混用会出现同一节点两种写法（ip-api 给「江苏」、
   ipwho 给「Jiangsu Sheng」、ipinfo 只给「CN」+「Jiangsu」）。现在统一映射成
   中文并去掉 Sheng/Province 之类后缀，展示保持一致。
 - 成功结果缓存 1 小时；失败只缓存 30 秒，避免一次网络抖动把错误锁死一小时。
+- 多个归属地服务并发探测（v1.3.1），取最快成功者，最坏耗时从 3×12s 降到 12s。
 - 错误信息翻译成人话，且不回显代理链接（防止泄漏凭据）。
 
 候选接口经实测筛选：ipwho.is 与 ipinfo.io 免鉴权且稳定；
@@ -21,6 +22,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import requests
 
@@ -123,20 +125,18 @@ GEO_SERVICES = [
         },
     },
     {
-        # 明文 HTTP 兜底：部分出口会劫持改写成 HTML，所以放最后
-        "name": "ip-api-http",
-        "url": "http://ip-api.com/json/",
-        "params": {"fields": "status,query,country,countryCode,regionName,city",
-                   "lang": "zh-CN"},
+        # HTTPS 兜底（v1.3.1 替换明文 HTTP 的 ip-api.com）
+        "name": "ip.sb",
+        "url": "https://api.ip.sb/geoip",
+        "params": {},
         "parse": lambda d: {
-            "ok": d.get("status") == "success" or bool(d.get("country")),
-            "ip": d.get("query", ""),
-            "country": _zh_country(d.get("country", ""), d.get("countryCode", "")),
-            "country_code": d.get("countryCode", ""),
-            "region": _clean_region(d.get("regionName", "")),
+            "ok": bool(d.get("ip")),
+            "ip": d.get("ip", ""),
+            "country": _zh_country(d.get("country", ""), d.get("country_code", "")),
+            "country_code": d.get("country_code", ""),
+            "region": _clean_region(d.get("region", "")),
             "city": d.get("city", ""),
-            "message": ("success" if d.get("status") == "success" or d.get("country")
-                        else d.get("message", "查询失败")),
+            "message": "success" if d.get("ip") else "查询失败",
         },
     },
 ]
@@ -146,6 +146,7 @@ _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 _CACHE_TTL = 3600        # 成功结果缓存 1 小时
 _FAIL_CACHE_TTL = 30     # 失败只缓存 30s，避免一次网络抖动锁死一小时
+_CACHE_MAX = 512         # 缓存上限，防止代理频繁轮换时无限增长
 
 
 def _via_proxy(socks_url: str) -> dict | None:
@@ -233,21 +234,28 @@ def _query_service(svc: dict, proxies: dict) -> dict:
 
 
 def _detect(socks_url: str) -> dict:
-    """通过 socks 代理查询归属地（依次尝试多个服务）。失败返回 ok=False。"""
+    """通过 socks 代理查询归属地（并发探测多个服务，取最快成功者）。
+
+    代理本身连不上/认证失败（fatal）时立即返回，不再等其余服务。
+    """
     proxies = _via_proxy(socks_url)
     if not proxies:
         return {"ok": False, "message": "不是 socks5 链接"}
 
     errors = []
-    for svc in GEO_SERVICES:
-        r = _query_service(svc, proxies)
-        if r.get("ok"):
-            return r
-        msg = r.get("message", "失败")
-        errors.append(msg)
-        # 代理本身连不上/认证失败，换接口也没意义，直接给结论
-        if r.get("fatal"):
-            return {"ok": False, "message": msg}
+    with ThreadPoolExecutor(max_workers=len(GEO_SERVICES)) as pool:
+        futures = {pool.submit(_query_service, svc, proxies): svc for svc in GEO_SERVICES}
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                r = fut.result()
+                if r.get("ok"):
+                    return r
+                msg = r.get("message", "失败")
+                errors.append(msg)
+                if r.get("fatal"):
+                    return {"ok": False, "message": msg}
     uniq = list(dict.fromkeys(errors))
     return {"ok": False, "message": uniq[0] if uniq else "所有归属地接口均失败"}
 
@@ -267,6 +275,10 @@ def detect(socks_url: str, use_cache: bool = True, force: bool = False) -> dict:
     result = _detect(key)
     result["_t"] = now
     with _cache_lock:
+        if len(_cache) >= _CACHE_MAX and key not in _cache:
+            # 淘汰最旧的条目
+            oldest = min(_cache, key=lambda k: _cache[k].get("_t", 0))
+            _cache.pop(oldest, None)
         _cache[key] = result
     return result
 

@@ -42,8 +42,12 @@ const mockLogs = [
   { id: 1, account_name: '小号B', status: 'failed', total: 0, success: 0, fail: 0, channel: 'SOCKS5 代理', message: 'Cookie 无效', created_at: '2026-08-17 07:00:02' },
 ];
 const mockAccounts = [
-  { id: 1, name: '小号A', enabled: 1, last_status: 'success', last_checkin: '2026-08-14 07:00:00', last_message: '签到完成', cookie_length: 40, cookie_preview: 'SUB=xxx…', remark: '', proxy: 'socks5://***@1.2.3.4:1080', proxy_id: 1, proxy_label: '香港节点' },
-  { id: 2, name: '小号B', enabled: 1, last_status: 'failed', last_checkin: null, last_message: 'Cookie 无效', cookie_length: 0, cookie_preview: '', remark: '', proxy: '', proxy_id: null, proxy_label: '' },
+  { id: 1, name: '小号A', enabled: 1, last_status: 'success', last_checkin: '2026-08-14 07:00:00', last_message: '签到完成', cookie_length: 40, remark: '', proxy: 'socks5://***@1.2.3.4:1080', proxy_id: 1, proxy_label: '香港节点',
+    cookie_health: 'ok', cookie_last_rotated_at: '2026-08-14 07:00:00', cookie_last_rotate_keys: 'SUB,SUBP', cookie_next_keepalive_at: '2026-08-14 19:00:00',
+    cookie_expiry: { alf_expires_at: '2027-08-14 07:00:00', observed_deadline: '2026-08-21 07:00:00', deadline: '2026-08-21 07:00:00', days_left: 7.0, state: 'ok', reason: '预计还能用 7 天' } },
+  { id: 2, name: '小号B', enabled: 1, last_status: 'failed', last_checkin: null, last_message: 'Cookie 无效', cookie_length: 0, remark: '', proxy: '', proxy_id: null, proxy_label: '',
+    cookie_health: 'invalid', cookie_last_rotated_at: '', cookie_last_rotate_keys: '', cookie_next_keepalive_at: '',
+    cookie_expiry: { alf_expires_at: '', observed_deadline: '', deadline: '', days_left: null, state: 'unknown', reason: '缺少 ALF 与续期记录，无法估算到期' } },
 ];
 const mockTasks = [
   { task_id: 'abc123', trigger_type: 'schedule', status: 'success', started_at: '2026-08-14 07:00:00', finished_at: '2026-08-14 07:00:05' },
@@ -60,6 +64,9 @@ const mockSettings = {
   checkin_delay_min: '3', checkin_delay_max: '8',
   tg_quote_enabled: '1', tg_only_on_change: '0', tg_silent: '0',
   log_retention_days: '30',
+  keepalive_enabled: '1', keepalive_interval_hours: '12', keepalive_gap_seconds: '30',
+  keepalive_max_per_tick: '20', cookie_session_ttl_days: '7',
+  cookie_expiry_warn_days: '2', cookie_warn_cooldown_hours: '12',
 };
 
 // --- mock fetch 路由 ---
@@ -112,9 +119,11 @@ function check(name, cond) {
 
   console.log('— 仪表盘 —');
   check('页面标题正确', window.document.title.includes('微博超话签到'));
-  check('6 张统计卡渲染', window.document.querySelectorAll('#statGrid .stat').length === 6);
+  check('7 张统计卡渲染', window.document.querySelectorAll('#statGrid .stat').length === 7);
   check('账号总数卡=2', window.document.querySelectorAll('#statGrid .stat .num')[0].textContent.includes('2'));
   check('累计超话签到卡=126', window.document.querySelectorAll('#statGrid .stat .num')[3].textContent.includes('126'));
+  check('Cookie 风险卡=1', window.document.querySelectorAll('#statGrid .stat .num')[6].textContent.includes('1'));
+  check('Cookie 风险卡标题', window.document.querySelectorAll('#statGrid .stat .lbl')[6].textContent.includes('Cookie'));
   check('7 天趋势柱渲染', window.document.querySelectorAll('#trendChart .trend-col').length === 7);
   check('每日一言展示', window.document.querySelector('#quoteBox').textContent.includes('日拱一卒'));
   check('每日一言出处', window.document.querySelector('#quoteFrom').textContent.includes('网络'));
@@ -133,6 +142,11 @@ function check(name, cond) {
   check('账号名正确', window.document.querySelector('#accTable tbody tr').textContent.includes('小号A'));
   const accTableText = window.document.querySelector('#accTable').textContent;
   check('账号行显示代理可读名称', accTableText.includes('香港节点'));
+  check('表头含 Cookie 有效期列', window.document.querySelector('#accTable thead').textContent.includes('Cookie 有效期'));
+  check('正常账号显示到期天数', window.document.querySelectorAll('#accTable tbody tr')[0].textContent.includes('约 7 天'));
+  check('失效账号显示已失效', window.document.querySelectorAll('#accTable tbody tr')[1].textContent.includes('已失效'));
+  check('到期徽章带 tooltip', !!window.document.querySelector('#accTable tbody tr .badge[title]'));
+  check('全部保活按钮存在', !!window.document.querySelector('#btn-keepalive-all'));
   check('账号行不含代理明文链接', !accTableText.includes('socks5://') && !accTableText.includes('@1.2.3.4'));
   check('账号行显示直连', accTableText.includes('直连'));
 
@@ -172,6 +186,9 @@ function check(name, cond) {
   check('防封等待最小值 120', window.document.querySelector('#s-anti_ban_wait_min').value === '120');
   check('每日一言开关存在', !!window.document.querySelector('#s-tg_quote_enabled'));
   check('仅异常推送开关存在', !!window.document.querySelector('#s-tg_only_on_change'));
+  check('保活开关默认开启', window.document.querySelector('#s-keepalive_enabled').checked === true);
+  check('续期间隔回填 12', window.document.querySelector('#s-keepalive_interval_hours').value === '12');
+  check('经验寿命回填 7', window.document.querySelector('#s-cookie_session_ttl_days').value === '7');
   check('日志保留天数默认 30', window.document.querySelector('#s-log_retention_days').value === '30');
   check('账号操作已按功能分组', window.document.querySelectorAll('.account-action-group').length === 2);
   check('设置页使用现代化布局', !!window.document.querySelector('.settings-modern'));

@@ -16,6 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .. import auth, database
+from .. import __version__
+from ..security import safe_exc, validate_weibo_url
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -213,13 +215,9 @@ class QrLoginFinish(BaseModel):
 
 # 真实登录态判定：m.weibo.cn 会给所有未登录访问者也 Set-Cookie 一个孤零零的假 SUB，
 # 必须 SUB 与 (SCF 或 SSOLoginState 或 ALF) 同时存在才视为真实登录。
-_REAL_LOGIN_KEYS = ("SCF", "SSOLoginState", "ALF")
-
-
 def _is_real_login(cookies: dict) -> bool:
-    if not cookies.get("SUB"):
-        return False
-    return any(cookies.get(k) for k in _REAL_LOGIN_KEYS)
+    from ..weibo_client import is_real_login
+    return is_real_login(cookies)
 
 
 def _collect_session_cookies(session: requests.Session) -> dict:
@@ -325,7 +323,7 @@ def start_qr_login(user: dict = Depends(auth.require_admin)):
         response.raise_for_status()
         payload = _parse_jsonp_response(response)
     except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(502, f"获取微博登录二维码失败：{exc}") from exc
+        raise HTTPException(502, f"获取微博登录二维码失败：{safe_exc(exc)}") from exc
 
     data = payload.get("data") or {}
     qrid = data.get("qrid")
@@ -393,9 +391,10 @@ def get_qr_login_status(session_id: str, user: dict = Depends(auth.require_admin
     login_url = data.get("url") or data.get("alt") or item.get("alt")
     if login_url:
         try:
-            session.get(login_url, timeout=15, allow_redirects=True)
-        except requests.RequestException as exc:
-            raise HTTPException(502, f"完成微博登录失败：{exc}") from exc
+            # 登录跳转 URL 来自微博响应，限定微博自家 host
+            session.get(validate_weibo_url(login_url), timeout=15, allow_redirects=True)
+        except (requests.RequestException, ValueError) as exc:
+            raise HTTPException(502, f"完成微博登录失败：{safe_exc(exc)}") from exc
 
     # 跨域同步（arrURL/crossDomainUrlList 等）+ 多域 Cookie 聚合
     cookies = _complete_qr_login(session, item, data)
@@ -688,11 +687,20 @@ def _resolve_proxy(payload: dict, current: str = "") -> dict:
 
 
 def _public(acc: dict) -> dict:
-    """对外输出：不泄露 cookie 全文，也不泄露代理凭据（v7.1）。"""
+    """对外输出：不泄露 cookie 全文，也不泄露代理凭据（v7.1）。
+
+    v1.3.1：不再返回 cookie_preview —— 20 字符前缀也是凭据片段。
+    """
     acc = dict(acc)
     cookie = acc.get("cookie") or acc.get("cookie_raw") or ""
     acc["cookie_length"] = len(cookie) if cookie else 0
-    acc["cookie_preview"] = (cookie[:20] + "…") if len(cookie) > 20 else cookie
+    # Cookie 生命周期是可展示元数据，不是凭据
+    try:
+        from ..scheduler import cookie_expiry_view
+        acc["cookie_expiry"] = cookie_expiry_view(acc)
+    except Exception as exc:  # 展示层不能因为时间解析问题把整个账号接口打挂
+        log.warning("cookie 到期视图计算失败：%s", safe_exc(exc))
+        acc["cookie_expiry"] = {}
     raw_proxy = acc.get("proxy", "") or ""
     # 代理只对外给“打码链接 + 可读名称 + 引用 id”，不给明文密码。
     acc["proxy"] = database.mask_proxy_url(raw_proxy)
@@ -778,9 +786,17 @@ def batch_import_accounts(data: AccountBatchImport, user: dict = Depends(auth.re
 
 # ========================= JSON 导出/导入 =========================
 
-@router.get("/export")
-def export_accounts(user: dict = Depends(auth.require_admin)):
+class ExportRequest(BaseModel):
+    """导出确认。Cookie 属高敏数据，要求显式确认并改用 POST，
+    避免 GET 请求被预取/历史记录/CSRF 场景意外触发。"""
+    confirm: bool = False
+
+
+@router.post("/export")
+def export_accounts(data: ExportRequest, user: dict = Depends(auth.require_admin)):
     """导出所有账号为 JSON 文件（不包含代理密码等敏感字段）。"""
+    if not data.confirm:
+        raise HTTPException(status_code=400, detail="请显式确认导出（confirm=true）")
     accounts = database.get_accounts()
     export_list = []
     for acc in accounts:
@@ -791,7 +807,7 @@ def export_accounts(user: dict = Depends(auth.require_admin)):
             "remark": acc.get("remark", ""),
         })
     return {
-        "version": "1.3.0",
+        "version": __version__,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(export_list),
         "accounts": export_list,
@@ -899,41 +915,101 @@ def delete_one(account_id: int, user: dict = Depends(auth.require_admin)):
     return {"ok": True}
 
 
-@router.post("/{account_id}/verify")
-def verify_one(account_id: int, user: dict = Depends(auth.require_admin)):
-    """校验账号 Cookie 是否有效（只校验，不签到）。"""
-    from ..weibo_client import CheckinOptions, normalize_cookie, verify_cookie
-    import requests as _req  # noqa
+def _verify_probe(acc: dict) -> dict:
+    """跑一次 /api/config 探测，并把换发结果与生命周期状态落库。
 
-    acc = database.get_account(account_id)
-    if not acc:
-        raise HTTPException(404, "账号不存在")
-    cookie = normalize_cookie(acc.get("cookie") or acc.get("cookie_raw") or "")
+    这里回收到的 Set-Cookie 一定要回写：校验动作本身就会让微博轮换 SUB，
+    把新值丢掉等于继续拿旧凭证撞接口，反而更快被判死。
+    """
+    from .. import scheduler as sched
+    from ..weibo_client import (
+        CheckinOptions, RateLimitedError, harvest_cookie_rotation,
+        new_account_session, normalize_cookie, verify_cookie,
+    )
+
+    raw_cookie = acc.get("cookie") or acc.get("cookie_raw") or ""
+    cookie = normalize_cookie(raw_cookie)
+    base_result = {
+        "status": "failed", "message": "", "total": 0, "success": 0, "fail": 0,
+        "results": [], "cookie": {}, "cookie_changed": [], "cookie_added": [],
+        "channel": "direct", "failure_type": None,
+    }
     if not cookie:
-        return {"valid": False, "message": "Cookie 为空"}
+        return {"valid": False, "message": "Cookie 为空", "rotated": []}
+
     opts = CheckinOptions.from_settings(database.get_setting)
-    # v7.1：优先用账号自己绑定的代理校验，与实际签到链路保持一致
+    # 优先用账号自己绑定的代理，与实际签到链路保持一致
     proxy = (acc.get("proxy") or "").strip() or None
     channel = "socks" if proxy else "direct"
     if not proxy and opts.proxies:
         idx = (acc.get("proxy_index") or 0) % len(opts.proxies)
         proxy = opts.proxies[idx]
         channel = "socks"
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        "Referer": "https://m.weibo.cn/",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    try:
-        logged_in, _st = verify_cookie(
-            session, cookie, channel=channel, proxy=proxy,
-            force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
-        )
-    except Exception as exc:
-        return {"valid": False, "message": f"请求异常：{exc}"}
-    return {"valid": logged_in,
-            "message": "Cookie 有效" if logged_in else "Cookie 无效或已过期",
-            "channel": channel}
+    base_result["channel"] = channel
+
+    with sched.get_account_lock(acc["id"]):
+        session = new_account_session()
+        try:
+            logged_in, _st = verify_cookie(
+                session, cookie, channel=channel, proxy=proxy,
+                force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
+            )
+        except RateLimitedError as exc:
+            sched.persist_cookie_observation(
+                acc, raw_cookie, cookie,
+                {**base_result, "failure_type": "rate_limited"})
+            return {"valid": False, "message": f"被风控：{safe_exc(exc)}",
+                    "channel": channel, "rotated": []}
+        except Exception as exc:
+            sched.persist_cookie_observation(
+                acc, raw_cookie, cookie,
+                {**base_result, "failure_type": "network"})
+            return {"valid": False, "message": f"请求异常：{safe_exc(exc)}",
+                    "channel": channel, "rotated": []}
+
+        merged, changed, added = harvest_cookie_rotation(session, cookie)
+        if not logged_in:
+            sched.persist_cookie_observation(
+                acc, raw_cookie, cookie,
+                {**base_result, "failure_type": "cookie_invalid"})
+            return {"valid": False, "message": "Cookie 无效或已过期",
+                    "channel": channel, "rotated": []}
+        sched.persist_cookie_observation(
+            acc, raw_cookie, cookie,
+            {**base_result, "status": "success", "cookie": merged,
+             "cookie_changed": changed, "cookie_added": added})
+
+    fresh = database.get_account(acc["id"]) or acc
+    return {"valid": True, "message": "Cookie 有效", "channel": channel,
+            "rotated": list(dict.fromkeys(changed + added)),
+            "cookie_health": fresh.get("cookie_health", "")}
+
+
+@router.post("/{account_id}/verify")
+def verify_one(account_id: int, user: dict = Depends(auth.require_admin)):
+    """校验账号 Cookie 是否有效（只校验，不签到）。"""
+    acc = database.get_account(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    return _verify_probe(acc)
+
+
+class KeepaliveIn(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+
+
+@router.post("/{account_id}/keepalive")
+def keepalive_one(account_id: int, user: dict = Depends(auth.require_admin)):
+    """立刻给单个账号续一期 cookie（忽略到期时间与签到让路）。"""
+    from .. import scheduler as sched
+    acc = database.get_account(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    return sched.run_keepalive_once([account_id], force=True)
+
+
+@router.post("/keepalive-all")
+def keepalive_all(data: KeepaliveIn, user: dict = Depends(auth.require_admin)):
+    """批量保活/校验：对选中账号（留空=全部到期账号）各跑一次探测并回写。"""
+    from .. import scheduler as sched
+    return sched.run_keepalive_once(data.account_ids or None, force=True)

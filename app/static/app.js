@@ -161,6 +161,7 @@ async function loadQuote(refresh=false) {
 function renderStats(stats, accounts) {
   const active = accounts.filter(a=>a.enabled);
   const okAcc = accounts.filter(a=>a.last_status==='success').length;
+  const riskyAcc = active.filter(a=>['invalid','expired','expiring','stale','rate_limited'].includes(a.cookie_health)).length;
   $('#statGrid').innerHTML = [
     card('账号总数', accounts.length, 'acc', '个'),
     card('启用中', active.length, '', '个'),
@@ -168,6 +169,7 @@ function renderStats(stats, accounts) {
     card('累计超话签到', stats.topics_signed || 0, 'green', '个'),
     card('成功率', stats.success_rate || 0, '', '%'),
     card('今日记录', stats.today || 0, '', '条'),
+    card('Cookie 风险', riskyAcc, riskyAcc ? 'red' : 'green', '个'),
   ].join('');
   var gridEl = document.getElementById('statGrid');
   var stats2 = gridEl.querySelectorAll('.stat');
@@ -181,6 +183,32 @@ function statusBadge(s) {
   const map = {success:['ok','✅'], partial:['warn','⚠️'], failed:['bad','❌'], running:['acc','🔄'], unknown:['gray','未知']};
   const [cls, lab] = map[s] || map.unknown;
   return `<span class="badge ${cls}">${lab} ${s==='success'?'成功':s==='partial'?'部分':s==='failed'?'失败':s==='running'?'运行中':'未知'}</span>`;
+}
+const COOKIE_HEALTH_MAP = {
+  ok: ['ok', '✅ 正常'],
+  expiring: ['warn', '⏳ 即将失效'],
+  expired: ['bad', '⏰ 已过期'],
+  invalid: ['bad', '🔐 已失效'],
+  stale: ['gray', '💤 保活未运行'],
+  network_error: ['warn', '📡 网络不通'],
+  rate_limited: ['bad', '🚧 被风控'],
+  unknown: ['gray', '未探测'],
+};
+function cookieExpiryCell(a) {
+  const view = a.cookie_expiry || {};
+  const [cls, label] = COOKIE_HEALTH_MAP[a.cookie_health] || COOKIE_HEALTH_MAP.unknown;
+  const days = view.days_left;
+  const showDays = (days !== null && days !== undefined && days !== '' && days > 0);
+  const countdown = showDays ? ' · 约 ' + Math.round(days * 10) / 10 + ' 天' : '';
+  const tip = [
+    'ALF 名义到期：' + (view.alf_expires_at || '无'),
+    '按续期推算失效：' + (view.observed_deadline || '暂无续期记录'),
+    '上次续期：' + (a.cookie_last_rotated_at || '从未') +
+      (a.cookie_last_rotate_keys ? '（' + a.cookie_last_rotate_keys + '）' : ''),
+    '下次保活：' + (a.cookie_next_keepalive_at || '未排期'),
+    view.reason || '',
+  ].join('\n');
+  return `<span class="badge ${cls}" title="${esc(tip)}">${label}${countdown}</span>`;
 }
 function renderRecentTasks(tasks) {
   const tb = $('#recentTasks tbody');
@@ -208,7 +236,7 @@ function renderDashAccounts(accounts) {
       <td>${accountIdentity(a)}</td>
       <td>${statusBadge(a.last_status)}</td>
       <td>${a.last_checkin||'从未'}</td>
-      <td style="white-space:normal;color:var(--muted)">${a.last_message||''}</td>
+      <td style="white-space:normal;color:var(--muted)">${esc(a.last_message||'')}</td>
     </tr>`).join('') : '<tr><td colspan="4" style="color:var(--muted)">暂无账号，请到「账号管理」添加</td></tr>';
 }
 $('#btn-refresh-acc').onclick = loadDashboard;
@@ -236,6 +264,7 @@ async function loadAccounts() {
         <td>${accountIdentity(a, true)}</td>
         <td>${a.enabled?statusBadge('success')+' 启用':'<span class="badge gray">已停用</span>'} <span style="color:var(--muted)">·</span> ${statusBadge(a.last_status)}</td>
         <td style="color:var(--muted)">${a.cookie_length} 字符</td>
+        <td>${cookieExpiryCell(a)}</td>
         <td>${a.proxy_label ? '<span class="badge">'+esc(a.proxy_label)+'</span>' : (a.proxy ? '<span class="badge">'+esc(a.proxy)+'</span>' : '<span class="badge gray">直连</span>')}</td>
         <td>${a.last_checkin||'从未'}</td>
         <td class="acc-actions">
@@ -244,7 +273,7 @@ async function loadAccounts() {
           <button class="btn btn-ghost btn-sm" data-action="verify" data-id="${a.id}">校验</button>
           <button class="btn btn-danger btn-sm" data-action="delete" data-id="${a.id}">删除</button>
         </td>
-      </tr>`).join('') : '<tr><td colspan="7" style="color:var(--muted)">暂无账号</td></tr>';
+      </tr>`).join('') : '<tr><td colspan="8" style="color:var(--muted)">暂无账号</td></tr>';
     // Event delegation for account actions
     tb.onclick = function(e) {
       var btn = e.target.closest('button[data-action]');
@@ -413,9 +442,28 @@ async function verifyAcc(id) {
   toast('校验中…');
   try {
     const r = await api.post(`/api/accounts/${id}/verify`, {});
-    toast(r.valid ? '✅ Cookie 有效' : '❌ ' + r.message, r.valid?'good':'err');
+    if (r.valid) {
+      const rotated = (r.rotated && r.rotated.length) ? '，已续期 ' + r.rotated.join('/') : '';
+      toast('✅ Cookie 有效' + rotated, 'good');
+    } else {
+      toast('❌ ' + r.message, 'err');
+    }
+    loadAccounts();
   } catch(e){ toast('校验失败','err'); }
 }
+
+const btnKeepaliveAll = $('#btn-keepalive-all');
+if (btnKeepaliveAll) btnKeepaliveAll.onclick = async () => {
+  btnKeepaliveAll.disabled = true;
+  toast('保活中…');
+  try {
+    const r = await api.post('/api/accounts/keepalive-all', { account_ids: [] });
+    toast(`🍪 检查 ${r.checked || 0} 个：续期 ${r.rotated || 0}，失效 ${r.invalid || 0}`,
+          r.invalid ? 'err' : 'good');
+    loadAccounts();
+  } catch(e){ toast('保活失败','err'); }
+  finally { btnKeepaliveAll.disabled = false; }
+};
 
 /* ===== 代理管理 ===== */
 let editingProxyId = null;
@@ -781,8 +829,10 @@ $('#batchImportModalSave').onclick = async () => {
 
 /* ===== 导出/导入 JSON ===== */
 $('#btn-export').onclick = async () => {
+  // 导出包含完整 Cookie，需显式确认（POST + confirm）
+  if (!confirm('导出文件包含全部账号的完整 Cookie，请妥善保管。确定继续？')) return;
   try {
-    const data = await api.get('/api/accounts/export');
+    const data = await api.post('/api/accounts/export', { confirm: true });
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -964,6 +1014,14 @@ async function loadSettings() {
     $('#s-topics_daily_push_cron').value = settingsCache.topics_daily_push_cron||'0 8 * * *';
     // 签到后自动刷新超话
     setVal('s-auto_refresh_topics', settingsCache.auto_refresh_topics==='1');
+    // Cookie 保活
+    setVal('s-keepalive_enabled', settingsCache.keepalive_enabled!=='0');
+    $('#s-keepalive_interval_hours').value = settingsCache.keepalive_interval_hours||'12';
+    $('#s-keepalive_gap_seconds').value = settingsCache.keepalive_gap_seconds||'30';
+    $('#s-keepalive_max_per_tick').value = settingsCache.keepalive_max_per_tick||'20';
+    $('#s-cookie_session_ttl_days').value = settingsCache.cookie_session_ttl_days||'7';
+    $('#s-cookie_expiry_warn_days').value = settingsCache.cookie_expiry_warn_days||'2';
+    $('#s-cookie_warn_cooldown_hours').value = settingsCache.cookie_warn_cooldown_hours||'12';
     // 推送模式：all / selected
     if ($('#s-topics_daily_push_mode')) {
       $('#s-topics_daily_push_mode').value = settingsCache.topics_daily_push_mode||'all';
@@ -1003,6 +1061,14 @@ function collectSettings() {
     topics_daily_push_mode: val('s-topics_daily_push_mode').trim() || 'all',
     // 签到后自动刷新超话
     auto_refresh_topics: chk('s-auto_refresh_topics'),
+    // Cookie 保活
+    keepalive_enabled: chk('s-keepalive_enabled'),
+    keepalive_interval_hours: val('s-keepalive_interval_hours','12'),
+    keepalive_gap_seconds: val('s-keepalive_gap_seconds','30'),
+    keepalive_max_per_tick: val('s-keepalive_max_per_tick','20'),
+    cookie_session_ttl_days: val('s-cookie_session_ttl_days','7'),
+    cookie_expiry_warn_days: val('s-cookie_expiry_warn_days','2'),
+    cookie_warn_cooldown_hours: val('s-cookie_warn_cooldown_hours','12'),
   };
 }
 $('#btn-save-all').onclick = async () => {
@@ -1120,7 +1186,7 @@ $('#btn-change-pwd').onclick = async () => {
   const oldP = $('#p-old').value, newP = $('#p-new').value;
   const st = $('#pwd-status');
   if (!oldP || !newP) { st.textContent = '请填写原密码和新密码'; return; }
-  if (newP.length < 6) { st.textContent = '新密码至少 6 位'; return; }
+  if (newP.length < 8) { st.textContent = '新密码至少 8 位'; return; }
   st.textContent = '提交中…';
   try {
     const r = await api.post('/api/auth/change-password', { old_password: oldP, new_password: newP });

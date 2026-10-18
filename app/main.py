@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -29,12 +28,12 @@ log = logging.getLogger("weibo.main")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = database.DB_PATH.parent
 
-# 不需要登录的公开路径
-PUBLIC_API_PREFIXES = (
+# 不需要登录的公开路径（精确匹配，避免前缀误放行）
+PUBLIC_API_PATHS = frozenset({
     "/api/auth/login", "/api/auth/me", "/api/health",
     "/api/auth/init", "/api/auth/needs-init",
-)
-PUBLIC_STATIC = ("/login.html", "/style.css", "/favicon.ico")
+})
+PUBLIC_STATIC = frozenset({"/login.html", "/style.css", "/favicon.ico"})
 
 
 @asynccontextmanager
@@ -50,16 +49,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="微博超话签到管理面板",
     description="微博超话批量签到 · 自动调度 · TG 通知 · 防封策略",
-    version="1.3.0",
+    version="1.3.2",
     lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 app.include_router(accounts_api.router)
@@ -71,11 +62,19 @@ app.include_router(topics_api.router)
 
 @app.get("/api/health")
 def health():
+    # 注意：这里的 ok 只代表"进程活着"，不代表登录态健康。
+    # cookie 全死也必须返回 ok=True —— Dockerfile 的 HEALTHCHECK 只看 HTTP 状态，
+    # 若因业务故障返回失败，配合 restart policy 会引发容器重启风暴。
+    try:
+        cookie_stats = database.count_cookie_health()
+    except Exception:
+        cookie_stats = {}
     return {
         "ok": True,
         "version": app.version,
         "time": database.get_setting("last_checkin_time", "never"),
         "auth_enabled": auth.auth_enabled(),
+        "cookie": cookie_stats,
     }
 
 
@@ -94,11 +93,11 @@ async def auth_guard(request: Request, call_next):
             return JSONResponse(status_code=403, content={"detail": "系统未初始化"})
         return RedirectResponse("/init.html", status_code=302)
 
-    # 登录相关与健康检查放行
-    if path.startswith(PUBLIC_API_PREFIXES):
+    # 登录相关与健康检查放行（精确匹配）
+    if path in PUBLIC_API_PATHS:
         return await call_next(request)
     # 静态资源：登录页/样式放行
-    if path in PUBLIC_STATIC or path == "/login.html":
+    if path in PUBLIC_STATIC:
         return await call_next(request)
     # 静态文件（app.js 等）需要登录才能访问页面依赖；但登录页本身要能加载
     if not auth.auth_enabled():
@@ -120,9 +119,12 @@ async def auth_guard(request: Request, call_next):
     return await call_next(request)
 
 
-# 持久化数据资源。头像保存在 data/avatars，并通过本地地址访问。
+# 持久化数据资源。仅挂载纯图片子目录 —— 严禁把 DATA_DIR 根目录整体挂出，
+# 否则 SQLite 数据库（含微博 Cookie、代理账密、会话 token）可被下载。
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
+AVATAR_DIR = DATA_DIR / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/data/avatars", StaticFiles(directory=str(AVATAR_DIR)), name="avatars")
 
 # 前端静态资源（构建好的单页）必须最后挂载，避免吞掉其他路由。
 if STATIC_DIR.exists():
@@ -137,6 +139,27 @@ async def _no_cache_static(request: Request, call_next):
     req_path = request.url.path
     if req_path.endswith((".html", ".js", ".css")) or req_path in ("/", "/index.html", "/login.html"):
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """基础安全响应头。
+
+    CSP 中 script/style 保留 'unsafe-inline'：前端使用内联事件
+    （img onerror 兜底头像等），收紧会直接破坏面板；该 CSP 仍可
+    阻断外部脚本注入与被滥用 framing。
+    """
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "
+        "font-src 'self' data:; connect-src 'self'",
+    )
     return resp
 
 # 为任务运行提供便捷的独立接口（供 run.py 调用）

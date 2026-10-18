@@ -27,8 +27,7 @@ def client(tmp_path, monkeypatch):
     db.create_user("admin", auth_mod.hash_password(GOOD_PW))
     db.set_settings({"auth_enabled": "1"})
     # v7.2 起登录有失败限流，清掉上一个测试留下的锁定状态
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
     from fastapi.testclient import TestClient
     with TestClient(app) as c:
@@ -140,6 +139,8 @@ def test_verify_endpoint_invalid_cookie(client):
         status_code = 200
         def json(self):
             return {"data": {"login": False, "st": None}}
+        def raise_for_status(self):
+            pass
 
     with patch.object(requests.Session, "request",
                       return_value=FakeResp()):
@@ -621,8 +622,7 @@ def test_schedule_next_api(client):
 def test_login_rate_limit_locks_after_repeated_failures(client, monkeypatch):
     """连续失败达到阈值后应返回 429，而不是无限允许爆破。"""
     import app.auth as auth_mod
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
     codes = []
     for _ in range(auth_mod.LOGIN_MAX_FAILS + 2):
@@ -639,8 +639,7 @@ def test_login_rate_limit_locks_after_repeated_failures(client, monkeypatch):
     assert r.headers.get("Retry-After")
 
     # 清理，避免影响其他测试
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
 
 def test_login_success_resets_failure_counter(tmp_path, monkeypatch):
@@ -652,8 +651,7 @@ def test_login_success_resets_failure_counter(tmp_path, monkeypatch):
     db.init_db()
     db.create_user("admin", auth_mod.hash_password(GOOD_PW))
     db.set_settings({"auth_enabled": "1"})
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
     from fastapi.testclient import TestClient
     with TestClient(app) as c:
@@ -667,22 +665,22 @@ def test_login_success_resets_failure_counter(tmp_path, monkeypatch):
         for _ in range(auth_mod.LOGIN_MAX_FAILS - 1):
             assert c.post("/api/auth/login",
                           json={"username": "admin", "password": BAD_PW}).status_code == 401
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
     db._local.conn = None
 
 
 def test_cookie_secure_flag_follows_forwarded_proto(tmp_path, monkeypatch):
-    """反代给出 X-Forwarded-Proto: https 时 Cookie 必须带 Secure；纯 HTTP 则不能带。"""
+    """可信反代（WCM_TRUST_PROXY=1）给出 X-Forwarded-Proto: https 时
+    Cookie 必须带 Secure；未声明可信时不得采信该头；纯 HTTP 不能带。"""
     import app.auth as auth_mod
+    monkeypatch.setenv("WCM_TRUST_PROXY", "1")
     db_path = tmp_path / "test_secure.db"
     monkeypatch.setattr(db, "DB_PATH", db_path)
     db._local.conn = None
     db.init_db()
     db.create_user("admin", auth_mod.hash_password(GOOD_PW))
     db.set_settings({"auth_enabled": "1"})
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
     from fastapi.testclient import TestClient
     with TestClient(app) as c:
@@ -695,12 +693,35 @@ def test_cookie_secure_flag_follows_forwarded_proto(tmp_path, monkeypatch):
         r = c.post("/api/auth/login", json={"username": "admin", "password": GOOD_PW})
         assert r.status_code == 200
         assert "secure" not in r.headers.get("set-cookie", "").lower()
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
     db._local.conn = None
 
 
-def test_is_secure_request_helper():
+def test_forwarded_headers_distrusted_by_default(tmp_path, monkeypatch):
+    """未设置 WCM_TRUST_PROXY 时（默认直连），伪造 XFF/X-Forwarded-Proto 不生效：
+    Secure 不会被误加，登录限流也不因伪造 XFF 而分流。"""
+    import app.auth as auth_mod
+    monkeypatch.delenv("WCM_TRUST_PROXY", raising=False)
+    db_path = tmp_path / "test_distrust.db"
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+    db._local.conn = None
+    db.init_db()
+    db.create_user("admin", auth_mod.hash_password(GOOD_PW))
+    db.set_settings({"auth_enabled": "1"})
+    auth_mod.reset_login_limits()
+
+    from fastapi.testclient import TestClient
+    with TestClient(app) as c:
+        r = c.post("/api/auth/login", json={"username": "admin", "password": GOOD_PW},
+                   headers={"X-Forwarded-Proto": "https",
+                            "X-Forwarded-For": "1.2.3.4"})
+        assert r.status_code == 200
+        assert "secure" not in r.headers.get("set-cookie", "").lower()
+    auth_mod.reset_login_limits()
+    db._local.conn = None
+
+
+def test_is_secure_request_helper(monkeypatch):
     import app.auth as auth_mod
 
     class _Req:
@@ -708,10 +729,13 @@ def test_is_secure_request_helper():
             self.headers = headers
             self.url = type("U", (), {"scheme": scheme})()
 
+    monkeypatch.setenv("WCM_TRUST_PROXY", "1")
     assert auth_mod.is_secure_request(_Req({"x-forwarded-proto": "https"})) is True
     assert auth_mod.is_secure_request(_Req({"x-forwarded-proto": "https, http"})) is True
     assert auth_mod.is_secure_request(_Req({"x-forwarded-proto": "http"})) is False
     assert auth_mod.is_secure_request(_Req({"x-forwarded-ssl": "on"})) is True
+    monkeypatch.delenv("WCM_TRUST_PROXY")
+    assert auth_mod.is_secure_request(_Req({"x-forwarded-proto": "https"})) is False
     assert auth_mod.is_secure_request(_Req({}, scheme="https")) is True
     assert auth_mod.is_secure_request(_Req({})) is False
 
@@ -817,3 +841,334 @@ def test_detect_endpoint_accepts_proxy_id(client, no_geo, monkeypatch):
     # 打码链接不应被当成真链接去拨号
     r = client.post("/api/proxies/detect", json={"url": "socks5://***@7.7.7.7:1080"})
     assert r.status_code == 400
+
+
+# ================== Cookie 保活与换发回写 ==================
+
+def _keepalive_env(tmp_path, monkeypatch, cookie="SUB=old; UOR=x"):
+    """独立临时库 + 一个账号，返回 (scheduler 模块, 账号 id)。"""
+    import app.database as local_db
+    import app.scheduler as sched
+
+    monkeypatch.setattr(local_db, "DB_PATH", tmp_path / "keepalive.db")
+    local_db._local.conn = None
+    local_db.init_db()
+    local_db.set_settings({"auth_enabled": "0", "anti_ban_enabled": "0",
+                           "keepalive_gap_seconds": "0", "tg_enabled": "0"})
+    acc_id = local_db.add_account({"name": "保活号", "cookie": cookie})
+    return sched, local_db, acc_id
+
+
+def _jar_session(pairs):
+    class _C:
+        def __init__(self, name, value):
+            self.name, self.value = name, value
+
+    class _S:
+        def __init__(self):
+            self.cookies = [_C(n, v) for n, v in pairs]
+
+    return _S()
+
+
+def test_writeback_persists_newly_issued_login_key(tmp_path, monkeypatch):
+    """回归根因：微博补发 SCF（同名 key 都没变）也必须落库，否则缺的凭据永远补不回。"""
+    from unittest.mock import patch
+    from app.weibo_client import _bundle
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+
+    def fake_checkin(cookie, opts, proxy_url=None, proxy_index=0):
+        merged = dict(cookie)
+        merged["SCF"] = "issued"          # 只新增，SUB 值没变
+        return _bundle("success", "ok", 1, 1, 0,
+                       [{"name": "超话", "success": True, "message": "已签到"}],
+                       merged, [], "direct", cookie_added=["SCF"])
+
+    with patch.object(sched, "run_account_checkin", side_effect=fake_checkin):
+        summary = sched.run_checkin("manual")
+
+    assert summary["status"] == "success"
+    stored = local_db.get_account(acc_id)["cookie"]
+    assert "SCF=issued" in stored, stored
+    acc = local_db.get_account(acc_id)
+    assert "SCF" in acc["cookie_last_rotate_keys"]
+    assert acc["cookie_last_rotated_at"]
+    assert acc["cookie_health"] in ("ok", "unknown", "expiring", "expired")
+    local_db._local.conn = None
+
+
+def test_writeback_refuses_losing_login_keys(tmp_path, monkeypatch):
+    """脏响应把 SUB 洗掉了，绝不能覆盖库里的完整凭据。"""
+    from unittest.mock import patch
+    from app.weibo_client import _bundle
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch,
+                                             cookie="SUB=old; SCF=c")
+
+    def fake_checkin(cookie, opts, proxy_url=None, proxy_index=0):
+        return _bundle("success", "ok", 1, 1, 0,
+                       [{"name": "超话", "success": True, "message": "已签到"}],
+                       {"SUB": "", "SCF": "c", "junk": "y"}, ["SCF"], "direct")
+
+    with patch.object(sched, "run_account_checkin", side_effect=fake_checkin):
+        sched.run_checkin("manual")
+
+    stored = local_db.get_account(acc_id)["cookie"]
+    assert "SUB=old" in stored, stored
+    assert "junk=y" not in stored
+    local_db._local.conn = None
+
+
+def test_cookie_invalid_stops_keepalive_without_overwriting(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    from app.weibo_client import _bundle
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch,
+                                             cookie="SUB=old; SCF=c")
+
+    def fake_checkin(cookie, opts, proxy_url=None, proxy_index=0):
+        return _bundle("failed", "Cookie 无效或已过期", 0, 0, 0, [],
+                       dict(cookie), [], "direct", failure_type="cookie_invalid")
+
+    with patch.object(sched, "run_account_checkin", side_effect=fake_checkin):
+        summary = sched.run_checkin("manual")
+
+    acc = local_db.get_account(acc_id)
+    assert acc["cookie_health"] == "invalid"
+    assert acc["cookie_next_keepalive_at"] == ""
+    assert acc["cookie"] == "SUB=old; SCF=c"
+    assert summary["detail"][0]["failure_type"] == "cookie_invalid"
+    local_db._local.conn = None
+
+
+def test_keepalive_rotates_cookie_and_reschedules(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    session = _jar_session([("SUB", "rotated"), ("SUBP", "p1")])
+
+    with patch.object(sched, "verify_cookie", return_value=(True, "st1")), \
+         patch.object(sched, "new_account_session", return_value=session):
+        stats = sched.run_keepalive_once([acc_id], force=True)
+
+    assert stats["checked"] == 1 and stats["rotated"] == 1
+    acc = local_db.get_account(acc_id)
+    assert acc["cookie"].startswith("SUB=rotated")
+    assert "SUBP=p1" in acc["cookie"]
+    assert acc["cookie_health"] in ("ok", "expiring", "expired")
+    assert acc["cookie_next_keepalive_at"]
+    assert acc["cookie_fail_streak"] == 0
+    local_db._local.conn = None
+
+
+def test_keepalive_network_failure_backs_off_without_killing_account(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    from app.weibo_client import NetworkError
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+
+    def boom(*a, **kw):
+        raise NetworkError("代理不通")
+
+    with patch.object(sched, "verify_cookie", side_effect=boom), \
+         patch.object(sched, "new_account_session", return_value=_jar_session([])):
+        stats = sched.run_keepalive_once([acc_id], force=True)
+
+    acc = local_db.get_account(acc_id)
+    assert stats["network"] == 1
+    assert acc["cookie_health"] == "network_error"
+    assert acc["cookie_fail_streak"] == 1
+    assert acc["cookie"] == "SUB=old; UOR=x"       # 网络故障不能改 cookie
+    assert acc["cookie_next_keepalive_at"]          # 仍在退避后重试
+    local_db._local.conn = None
+
+
+def test_keepalive_marks_dead_and_reports(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    local_db.set_cookie_state(acc_id, cookie_issued_at="2020-01-01 00:00:00")
+    local_db.set_settings({"tg_enabled": "1"})
+    sent = []
+    with patch.object(sched, "verify_cookie", return_value=(False, None)), \
+         patch.object(sched, "new_account_session", return_value=_jar_session([])), \
+         patch.object(sched.notifier, "send_cookie_warning",
+                      side_effect=lambda items: sent.append(items)):
+        stats = sched.run_keepalive_once([acc_id])
+
+    assert stats["invalid"] == 1
+    assert local_db.get_account(acc_id)["cookie_health"] == "invalid"
+    assert sent and sent[0][0]["health"] == "invalid"
+    local_db._local.conn = None
+
+
+def test_keepalive_yields_to_running_checkin(tmp_path, monkeypatch):
+    """签到进行中时保活必须让路 —— 两边同 IP 叠认证请求最容易触发风控。"""
+    import threading
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    local_db.set_cookie_state(acc_id, cookie_next_keepalive_at="2020-01-01 00:00:00")
+    held = threading.Lock()
+    held.acquire()
+    with patch.object(sched, "_running_lock", held), \
+         patch.object(sched, "run_keepalive_once") as spy:
+        sched._keepalive_job()
+    assert spy.called is False
+    local_db._local.conn = None
+
+
+def test_keepalive_disabled_by_setting(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    local_db.set_settings({"keepalive_enabled": "0"})
+    local_db.set_cookie_state(acc_id, cookie_next_keepalive_at="2020-01-01 00:00:00")
+    with patch.object(sched, "run_keepalive_once") as spy:
+        sched._keepalive_job()
+    assert spy.called is False
+    local_db._local.conn = None
+
+
+def test_account_exception_does_not_abort_batch(tmp_path, monkeypatch):
+    """L0 回归：单个账号抛异常，其余账号照常签到。"""
+    from unittest.mock import patch
+
+    from app.weibo_client import _bundle
+
+    import app.database as local_db
+    import app.scheduler as sched_module
+    monkeypatch.setattr(local_db, "DB_PATH", tmp_path / "isolate.db")
+    local_db._local.conn = None
+    local_db.init_db()
+    local_db.set_settings({"auth_enabled": "0", "anti_ban_enabled": "0", "tg_enabled": "0"})
+    [local_db.add_account({"name": f"号{i}", "cookie": "SUB=s%d; SCF=c" % i})
+     for i in range(3)]
+
+    def flaky(cookie, opts, proxy_url=None, proxy_index=0):
+        if "s1" in str(cookie):
+            raise RuntimeError("模拟微博接口炸了")
+        return _bundle("success", "ok", 1, 1, 0,
+                       [{"name": "超话", "success": True, "message": "已签到"}],
+                       dict(cookie), [], "direct")
+
+    with patch.object(sched_module, "run_account_checkin", side_effect=flaky):
+        summary = sched_module.run_checkin("manual")
+
+    assert summary["accounts"] == 3, summary
+    statuses = {e["name"]: e["status"] for e in summary["detail"]}
+    assert len(statuses) == 3
+    assert any(e.get("failure_type") == "internal_error" for e in summary["detail"])
+    assert summary["success"] == 2
+    local_db._local.conn = None
+
+
+def test_topics_list_error_is_not_cookie_invalid(tmp_path, monkeypatch):
+    """列表接口抖动应归到 topics_list_error，不能误判成 cookie 失效催重登。"""
+    from unittest.mock import patch
+
+    import app.weibo_client as client
+    import app.database as local_db
+    from app.weibo_client import CheckinOptions
+
+    monkeypatch.setattr(local_db, "DB_PATH", tmp_path / "topics_err.db")
+    local_db._local.conn = None
+    local_db.init_db()
+
+    opts = CheckinOptions(checkin_delay_min=0, checkin_delay_max=0)
+    with patch.object(client, "verify_cookie", return_value=(True, "st")), \
+         patch.object(client, "get_followed_topics",
+                      side_effect=RuntimeError("微博未能返回关注超话列表：500")):
+        result = client.run_account_checkin({"SUB": "s", "SCF": "c"}, opts)
+
+    assert result["failure_type"] == "topics_list_error"
+    assert result["status"] == "failed"
+    local_db._local.conn = None
+
+
+def test_topics_list_expired_maps_to_cookie_invalid(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    import app.weibo_client as client
+    from app.weibo_client import CheckinOptions, CookieExpiredError
+
+    opts = CheckinOptions(checkin_delay_min=0, checkin_delay_max=0)
+    with patch.object(client, "verify_cookie", return_value=(True, "st")), \
+         patch.object(client, "get_followed_topics",
+                      side_effect=CookieExpiredError("ok=-100")):
+        result = client.run_account_checkin({"SUB": "s", "SCF": "c"}, opts)
+
+    assert result["failure_type"] == "cookie_invalid"
+
+
+def test_keepalive_all_and_single_endpoints(client, monkeypatch):
+    """新端点可用且不会真的出网（verify_cookie 被 mock）。"""
+    from unittest.mock import patch
+
+    import app.scheduler as sched
+
+    acc_id = client.post("/api/accounts", json={
+        "name": "保活号", "cookie_raw": "SUB=s; SCF=c",
+    }).json()["id"]
+    with patch.object(sched, "verify_cookie", return_value=(True, "st")), \
+         patch.object(sched, "new_account_session",
+                      return_value=_jar_session([("SUB", "s2")])):
+        r = client.post(f"/api/accounts/{acc_id}/keepalive")
+        assert r.status_code == 200
+        assert r.json()["checked"] == 1
+        assert r.json()["rotated"] == 1
+        r2 = client.post("/api/accounts/keepalive-all", json={"account_ids": [acc_id]})
+        assert r2.status_code == 200
+        # 库里已是 s2，同样的凭证不再产生换发，但账号仍判有效
+        assert r2.json()["checked"] == 1 and r2.json()["rotated"] == 0
+        assert r2.json()["alive"] == 1
+
+
+def test_verify_endpoint_returns_expiry_and_health(client, monkeypatch):
+    from unittest.mock import patch
+
+    import app.weibo_client as client_mod
+
+    acc_id = client.post("/api/accounts", json={
+        "name": "校验号", "cookie_raw": "SUB=s; SCF=c; ALF=1893456000",
+    }).json()["id"]
+    with patch.object(client_mod, "verify_cookie", return_value=(True, "st")), \
+         patch.object(client_mod, "new_account_session",
+                      return_value=_jar_session([("SUB", "s")])):
+        body = client.post(f"/api/accounts/{acc_id}/verify").json()
+
+    assert body["valid"] is True, body
+    assert body["cookie_health"] in ("ok", "expiring", "expired", "unknown")
+    listed = client.get("/api/accounts").json()[0]
+    assert listed["cookie_expiry"]["alf_expires_at"].startswith("2030-")
+    assert listed["cookie_health"]
+
+
+def test_settings_keepalive_keys_are_writable(client):
+    """新设置 key 必须同时进白名单，否则"改了没生效"。"""
+    r = client.post("/api/settings", json={
+        "keepalive_enabled": "0", "keepalive_interval_hours": "6",
+        "keepalive_gap_seconds": "15", "keepalive_max_per_tick": "5",
+        "cookie_session_ttl_days": "5", "cookie_expiry_warn_days": "1",
+        "cookie_warn_cooldown_hours": "3", "not_a_real_key": "x",
+    })
+    assert r.status_code == 200
+    saved = r.json()
+    assert saved["keepalive_enabled"] == "0"
+    assert saved["keepalive_interval_hours"] == "6"
+    assert saved["cookie_session_ttl_days"] == "5"
+    assert saved["cookie_warn_cooldown_hours"] == "3"
+    assert "not_a_real_key" not in saved
+
+
+def test_health_exposes_cookie_stats_without_failing(client):
+    """cookie 全死也只代表业务故障：/api/health 的 ok 必须仍为 True，
+    否则 Docker HEALTHCHECK + restart policy 会引发重启风暴。"""
+    acc_id = client.post("/api/accounts", json={
+        "name": "死号", "cookie_raw": "SUB=dead",
+    }).json()["id"]
+    db.mark_cookie_dead(acc_id)
+    body = client.get("/api/health").json()
+    assert body["ok"] is True
+    assert body["cookie"].get("invalid") == 1

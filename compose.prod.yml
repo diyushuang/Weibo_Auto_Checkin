@@ -1,6 +1,9 @@
 # ============================================================
 # 微博签到管理面板 · 生产 compose（部署到远端服务器用）
 # 仅拉取镜像运行，不含 build；数据挂载到宿主目录。
+# 多架构 manifest：amd64/arm64 服务器 docker pull 自动匹配。
+#
+# 反向代理部署请追加环境变量 WCM_TRUST_PROXY=1（采信 X-Forwarded-*）。
 #
 # 服务器上用法:
 #   docker compose -f compose.prod.yml up -d
@@ -21,12 +24,16 @@ services:
       - APP_PORT=8000
       - WCM_ADMIN_USER=${WCM_ADMIN_USER:-admin}
       - WCM_ADMIN_PASSWORD=${WCM_ADMIN_PASSWORD:-}
+      - WCM_TRUST_PROXY=${WCM_TRUST_PROXY:-0}
     volumes:
       - ${WCM_DATA_DIR:-./data}:/app/data
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request,sys,os; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ['APP_PORT']+'/api/health', timeout=3).status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+    # 只读根文件系统：应用只写 /app/data 与 /tmp
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 镜像内已带 HEALTHCHECK，此处无需重复声明

@@ -165,8 +165,7 @@ def client(tmp_path, monkeypatch):
     db.init_db()
     db.create_user("admin", auth_mod.hash_password("secret" + "123"))
     db.set_settings({"auth_enabled": "1"})
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
     from fastapi.testclient import TestClient
     with TestClient(app) as c:
         r = c.post("/api/auth/login", json={"username": "admin", "password": "secret" + "123"})
@@ -225,7 +224,9 @@ def test_qr_status_confirmed_aggregates_arrurl_and_keeps_real_login(client):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "confirmed"
-    assert "SUB=sub-cn" in body.get("cookie_preview", "") or body["cookie_length"] > 0
+    # v1.3.1：对外不再返回 cookie_preview（凭据片段），仅保留长度
+    assert "cookie_preview" not in body
+    assert body["cookie_length"] > 0
     # 至少命中了 arrURL 中的 m.weibo.cn 跨域回调以及兜底 m.weibo.cn 请求
     sent = item["session"]._get_sent() if hasattr(item["session"], "_get_sent") else None
     # 直接验证 _complete_qr_login 调用了每个回调 URL

@@ -88,8 +88,8 @@ def change_password(
     db_user = database.get_user(user["id"])
     if not auth.verify_password(data.old_password, db_user["password_hash"]):
         raise HTTPException(status_code=400, detail="原密码错误")
-    if len(data.new_password) < 6:
-        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="新密码至少 8 位")
     database.update_user_password(db_user["id"], auth.hash_password(data.new_password))
     # 密码修改后踢掉旧会话
     database.delete_user_sessions(user["id"])
@@ -101,19 +101,19 @@ def change_password(
 @router.post("/init")
 def init_first_user(data: InitIn, request: Request):
     """首次部署：设置管理员账号密码（仅当系统无任何用户时可用）。"""
-    if database.count_users() > 0:
-        raise HTTPException(status_code=400, detail="系统已初始化，不能重复设置")
     username = data.username.strip()
     if not username or len(username) < 2:
         raise HTTPException(status_code=400, detail="用户名至少 2 个字符")
-    if len(data.password) < 6:
-        raise HTTPException(status_code=400, detail="密码至少 6 位")
-    database.create_user(username, auth.hash_password(data.password))
+    if len(data.password) < 8:
+        raise HTTPException(status_code=400, detail="密码至少 8 位")
+    # 事务内原子判断"是否首个用户"，防止并发请求绕过 count_users 检查
+    user_id = database.try_create_first_user(username, auth.hash_password(data.password))
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="系统已初始化，不能重复设置")
     database.set_settings({"admin_initialized": "1"})
     # 初始化后自动登录
     token = auth.generate_token()
-    db_user = database.get_user_by_name(username)
-    database.create_session(token, db_user["id"], auth.SESSION_TTL_HOURS)
+    database.create_session(token, user_id, auth.SESSION_TTL_HOURS)
 
     from fastapi.responses import RedirectResponse
     resp = RedirectResponse("/", status_code=302)

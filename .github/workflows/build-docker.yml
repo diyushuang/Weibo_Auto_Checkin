@@ -44,6 +44,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.TAGS }}
           cache-from: type=gha
@@ -51,5 +52,5 @@ jobs:
 
       - name: Verify pushed image
         run: |
-          echo "✅ 镜像已推送:"
+          echo "✅ 镜像已推送（linux/amd64 + linux/arm64）:"
           echo "  - ${{ steps.meta.outputs.TAGS }}"

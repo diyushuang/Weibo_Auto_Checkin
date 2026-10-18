@@ -23,8 +23,7 @@ def client(tmp_path, monkeypatch):
     from app import auth as auth_mod
     db.create_user("admin", auth_mod.hash_password(GOOD_PW))
     db.set_settings({"auth_enabled": "1"})
-    auth_mod._login_fails.clear()
-    auth_mod._login_locks.clear()
+    auth_mod.reset_login_limits()
 
     from fastapi.testclient import TestClient
     with TestClient(app) as c:
@@ -212,11 +211,52 @@ def test_topics_api_posts_endpoint(client):
     assert body["ok"] is True
     assert body["count"] == 1
     assert body["posts"][0]["text"] == "测试帖子内容"
-    assert body["account_used"] == 0  # 公开访问，不需要账号
-    assert body["account_name"] == "公开访问"
+    assert body["account_used"] == acc["id"]  # 优先用账号 Cookie 拉取
+    assert body["account_name"] == "测试号"
     # 图片 URL 应被替换为代理地址
     assert "/api/topics/img?url=" in body["posts"][0]["pics"][0]
     assert "/api/topics/img?url=" in body["posts"][0]["user"]["profile_image_url"]
+
+
+def test_topics_api_posts_anonymous_fallback(client):
+    """无账号时应回退匿名拉取。"""
+    from unittest.mock import patch
+    fake_posts = [
+        {"mid": "456", "text": "匿名帖子", "created_at": "", "source": "",
+         "reposts_count": 0, "comments_count": 0, "attitudes_count": 0,
+         "pics": [], "user": {"id": "1", "screen_name": "u", "profile_image_url": ""}},
+    ]
+    with patch("app.api.topics.fetch_topic_posts", return_value={"posts": fake_posts, "error": ""}):
+        r = client.get("/api/topics/posts/100808xyz?count=20")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["count"] == 1
+    assert body["account_used"] == 0
+    assert body["account_name"] == "公开访问"
+
+
+def test_topics_api_posts_failure_error(client):
+    """无账号且匿名失败时应返回聚合错误信息。"""
+    from unittest.mock import patch
+    with patch("app.api.topics.fetch_topic_posts",
+               return_value={"posts": [], "error": "微博要求登录（匿名访问已关闭）"}):
+        r = client.get("/api/topics/posts/100808xyz")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 0
+    assert "微博要求登录" in body["error"]
+
+
+def test_fetch_topic_posts_login_error_message():
+    """ok=-100 时应按是否带 Cookie 区分「要求登录」与「Cookie 过期」。"""
+    from unittest.mock import patch
+    import app.weibo_client as wc
+    with patch("app.weibo_client.request_json", return_value={"ok": -100}):
+        anon = wc.fetch_topic_posts(wc.requests.Session(), {}, "100808abc")
+        with_cookie = wc.fetch_topic_posts(wc.requests.Session(), {"SUB": "x"}, "100808abc")
+    assert "微博要求登录" in anon["error"]
+    assert "Cookie 过期" in with_cookie["error"]
 
 
 def test_ai_summary_without_config(client):

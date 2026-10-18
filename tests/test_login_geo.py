@@ -86,30 +86,35 @@ def test_query_service_parses_ipwho_success(monkeypatch):
     assert out["region"] == "九龙"
 
 
-def test_query_service_parses_ipapi_http_success(monkeypatch):
-    """兜底的明文 ip-api 解析仍然可用。"""
+def test_query_service_parses_ipsb_success(monkeypatch):
+    """HTTPS 兜底服务（ip.sb）解析可用。"""
     class _R:
         status_code = 200
         headers = {"content-type": "application/json"}
-        text = '{"status":"success","query":"1.2.3.4","country":"香港","countryCode":"HK","regionName":"Kowloon","city":"香港"}'
+        text = '{"ip":"1.2.3.4","country":"Hong Kong","country_code":"HK","region":"Kowloon","city":"Hong Kong"}'
         def json(self):
             import json
             return json.loads(self.text)
     monkeypatch.setattr(geo.requests, "get", lambda *a, **k: _R())
-    svc = [s for s in geo.GEO_SERVICES if s["name"] == "ip-api-http"][0]
+    svc = [s for s in geo.GEO_SERVICES if s["name"] == "ip.sb"][0]
     out = geo._query_service(svc, {})
     assert out["ok"] is True
     assert out["country_code"] == "HK"
 
 
+def test_all_services_are_https():
+    """v1.3.1 起不再使用明文 HTTP 归属地接口。"""
+    assert all(s["url"].startswith("https://") for s in geo.GEO_SERVICES)
+
+
 def test_query_service_fallback_to_next_service(monkeypatch):
-    """首选服务（ipwho）失败时应继续尝试下一个（ipinfo）。"""
+    """首选服务（ipwho）失败时，其余并发服务（ipinfo/ip.sb）仍能给出结果。"""
     calls = {"n": 0}
 
     class _R:
         status_code = 200
         headers = {"content-type": "application/json"}
-        text = '{"ip":"9.9.9.9","country":"US","region":"California","city":"LA"}'
+        text = '{"ip":"9.9.9.9","country":"US","country_code":"US","region":"California","city":"LA"}'
         def json(self):
             import json
             return json.loads(self.text)
@@ -124,18 +129,14 @@ def test_query_service_fallback_to_next_service(monkeypatch):
     geo.clear_cache()
     out = geo._detect("socks5://u:p@1.2.3.4:1080")
     assert out["ok"] is True
-    assert out["country_code"] == "US"
     assert out["region"] == "加州"
-    assert calls["n"] == 1
+    assert calls["n"] == 1   # ipwho 恰好失败一次
     geo.clear_cache()
 
 
 def test_proxy_error_stops_trying_other_services(monkeypatch):
-    """代理本身拒连时不必再轮其他接口，直接给结论。"""
-    calls = {"n": 0}
-
+    """代理本身拒连（fatal）时立即给出结论，不等待其余接口的成功结果。"""
     def fake_get(url, *a, **k):
-        calls["n"] += 1
         raise geo.requests.exceptions.ProxyError(
             "Cannot connect to proxy. GeneralProxyError('Socket error: "
             "0x01: General SOCKS server failure')")
@@ -144,7 +145,7 @@ def test_proxy_error_stops_trying_other_services(monkeypatch):
     geo.clear_cache()
     out = geo._detect("socks5://u:p@1.2.3.4:1080")
     assert out["ok"] is False
-    assert calls["n"] == 1          # 只试一次就停
+    # 并发探测下其余服务的结果会被丢弃，直接返回 fatal 结论
     assert "密码" in out["message"] or "SOCKS" in out["message"]
     geo.clear_cache()
 

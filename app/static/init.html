@@ -6,15 +6,26 @@
   <title>初始化 · 微博签到管理面板</title>
   <link rel="stylesheet" href="/style.css" />
   <style>
-    .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)}
-    .login-card{width:380px;max-width:92vw;background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:34px 30px;box-shadow:var(--shadow)}
+    .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;background:var(--bg)}
+    .login-wrap::before{content:"";position:absolute;inset:0;pointer-events:none;
+      background:
+        radial-gradient(420px 420px at 14% 20%, rgba(var(--accent-rgb),.13), transparent 70%),
+        radial-gradient(520px 520px at 86% 80%, rgba(var(--accent-rgb),.09), transparent 70%),
+        radial-gradient(rgba(var(--accent-rgb),.05) 1px, transparent 1px);
+      background-size:auto,auto,24px 24px}
+    .login-card{position:relative;z-index:1;width:380px;max-width:92vw;background:color-mix(in srgb,var(--surface) 88%,transparent);
+      backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);
+      border:1px solid color-mix(in srgb,var(--line) 80%,transparent);border-radius:20px;padding:36px 32px;
+      box-shadow:0 24px 64px rgba(16,24,40,.14),0 4px 16px rgba(16,24,40,.06),inset 0 1px 0 rgba(255,255,255,.6);
+      animation:loginIn .45s cubic-bezier(.2,.8,.2,1)}
+    @keyframes loginIn{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:none}}
     .login-brand{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-    .login-brand .logo{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;background:var(--accent);color:var(--accent-ink);font-weight:800;font-size:19px;box-shadow:0 4px 12px rgba(224,36,94,.35)}
-    .login-brand h1{margin:0;font-size:18px}
+    .login-brand .logo{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;background:var(--grad);color:var(--accent-ink);font-weight:800;font-size:19px;box-shadow:0 6px 18px rgba(var(--accent-rgb),.4),inset 0 1px 0 rgba(255,255,255,.25)}
+    .login-brand h1{margin:0;font-size:18px;letter-spacing:-.2px}
     .login-brand p{margin:2px 0 0;color:var(--muted);font-size:12px}
     .login-card label{display:block;font-size:13px;color:var(--muted);font-weight:600;margin:14px 0 6px}
-    .login-card input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface-2);color:var(--ink);font:inherit;outline:none}
-    .login-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(224,36,94,.15)}
+    .login-card input{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);font:inherit;outline:none;transition:border .18s,box-shadow .18s;box-shadow:inset 0 1px 2px rgba(16,24,40,.03)}
+    .login-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(var(--accent-rgb),.15)}
     .login-card .btn{width:100%;margin-top:22px;padding:11px}
     .login-err{color:var(--danger);font-size:13px;margin-top:10px;min-height:18px}
     .init-hero{font-size:12px;color:var(--muted);line-height:1.7;margin:0 0 6px}
@@ -33,7 +44,7 @@
     <p class="init-hero">这是首次部署（系统尚无用户）。设置管理者账号密码后即可登录使用。</p>
     <label>用户名</label>
     <input type="text" id="username" autocomplete="off" required autofocus placeholder="例如 admin" />
-    <label>密码（至少 6 位）</label>
+    <label>密码（至少 8 位）</label>
     <input type="password" id="password" autocomplete="new-password" required />
     <label>确认密码</label>
     <input type="password" id="password2" autocomplete="new-password" required />
@@ -48,7 +59,7 @@ form.addEventListener('submit', async e => {
   err.textContent = '';
   const u = username.value.trim(), p1 = password.value, p2 = password2.value;
   if (u.length < 2) { err.textContent='用户名至少 2 个字符'; return; }
-  if (p1.length < 6) { err.textContent='密码至少 6 位'; return; }
+  if (p1.length < 8) { err.textContent='密码至少 8 位'; return; }
   if (p1 !== p2) { err.textContent='两次密码不一致'; return; }
   btn.disabled = true; btn.textContent = '创建中…';
   try {

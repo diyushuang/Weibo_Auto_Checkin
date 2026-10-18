@@ -11,12 +11,18 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .weibo_client import cookie_to_string, normalize_cookie, parse_cookie_expiry, parse_time
+
 # 数据库文件默认放在项目根目录下
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "weibo_checkin.db"
 
 log = logging.getLogger("weibo.database")
 
 _local = threading.local()
+
+# 写锁：并行签到线程同时写库时，WAL 允许多读单写，
+# 配合 busy_timeout 排队写请求，避免 "database is locked" 直接抛错。
+_write_lock = threading.RLock()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -28,6 +34,8 @@ def _get_conn() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        # 写冲突时等待而非立刻失败（毫秒）
+        conn.execute("PRAGMA busy_timeout=5000;")
         _local.conn = conn
     return conn
 
@@ -62,6 +70,17 @@ def init_db() -> None:
             last_status  TEXT NOT NULL DEFAULT 'unknown', -- success/failed/partial/unknown
             last_checkin TEXT,                         -- 上次签到时间
             last_message TEXT NOT NULL DEFAULT '',
+            -- Cookie 生命周期（微博靠服务端 session 维持登录，需要持续观测与续期）
+            cookie_expires_at             TEXT    NOT NULL DEFAULT '',  -- ALF 解析出的名义到期
+            cookie_issued_at              TEXT    NOT NULL DEFAULT '',  -- 当前这份 cookie 的录入时间
+            cookie_last_seen_valid_at     TEXT    NOT NULL DEFAULT '',  -- 上次确认登录态有效
+            cookie_last_rotated_at        TEXT    NOT NULL DEFAULT '',  -- 上次成功换发回写
+            cookie_last_rotate_keys       TEXT    NOT NULL DEFAULT '',  -- 上次换发变化的 key
+            cookie_next_keepalive_at      TEXT    NOT NULL DEFAULT '',  -- 下次保活时间
+            cookie_health                 TEXT    NOT NULL DEFAULT 'unknown', -- ok/expiring/stale/invalid/network_error/rate_limited/unknown
+            cookie_fail_streak            INTEGER NOT NULL DEFAULT 0,   -- 连续保活失败次数（退避用）
+            cookie_warned_at              TEXT    NOT NULL DEFAULT '',  -- 上次 TG 到期预警（去重用）
+            cookie_lifetime_observed_days INTEGER NOT NULL DEFAULT 0,   -- 上次真死时实测的 session 寿命
             created_at   TEXT NOT NULL,
             updated_at   TEXT NOT NULL
         );
@@ -183,6 +202,13 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_topic_posts_cache_topic_id ON topic_posts_cache(topic_id);
 
+        -- 登录失败限流（持久化，重启不丢、多进程共享）
+        CREATE TABLE IF NOT EXISTS login_locks (
+            ip          TEXT PRIMARY KEY,
+            fails       TEXT NOT NULL DEFAULT '[]',  -- JSON：窗口内失败时间戳列表
+            locked_until REAL NOT NULL DEFAULT 0     -- 锁定截止时间戳（秒）
+        );
+
         """
     )
     conn.commit()
@@ -199,11 +225,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
     account_additions = {
         "avatar_url": "TEXT NOT NULL DEFAULT ''",
         "weibo_uid": "TEXT NOT NULL DEFAULT ''",
+        # Cookie 生命周期观测与保活
+        "cookie_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_issued_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_last_seen_valid_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_last_rotated_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_last_rotate_keys": "TEXT NOT NULL DEFAULT ''",
+        "cookie_next_keepalive_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_health": "TEXT NOT NULL DEFAULT 'unknown'",
+        "cookie_fail_streak": "INTEGER NOT NULL DEFAULT 0",
+        "cookie_warned_at": "TEXT NOT NULL DEFAULT ''",
+        "cookie_lifetime_observed_days": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in account_additions.items():
         if name not in account_cols:
             conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
             log.info("accounts 表已迁移：新增 %s 列", name)
+    # 老账号补齐 cookie 录入时间基准，否则寿命/到期算不出来
+    conn.execute(
+        "UPDATE accounts SET cookie_issued_at = created_at "
+        "WHERE cookie_issued_at = '' AND created_at IS NOT NULL"
+    )
 
     # 代理测试结果需要持久显示，避免前端刷新后延迟/结果消失。
     proxy_cols = [r["name"] for r in conn.execute("PRAGMA table_info(proxies)").fetchall()]
@@ -242,7 +284,6 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
         "proxy_fallback": "1",        # 允许失败回退直连
         "checkin_delay_min": "3",     # 超话间随机延时（秒）
         "checkin_delay_max": "8",
-        "cookie_valid": "0",          # 最近一次 Cookie 是否校验过（占位）
         "auth_enabled": "1",          # 是否启用登录保护
         "admin_initialized": "0",     # 默认管理员是否已初始化
         # ---- v7.0 新增 ----
@@ -255,6 +296,14 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
         "ai_api_key": "",           # API Key
         "ai_model": "gpt-4o-mini",  # 模型名
         "ai_topic_prompt": "你是一个超话内容总结助手。请对以下超话帖子内容进行简洁总结（200字以内），包括：1. 主要讨论话题 2. 热门帖子要点 3. 整体氛围。只输出总结文字，不要任何前缀或格式标记。",
+        # ---- Cookie 保活与到期预警 ----
+        "keepalive_enabled": "1",            # 定时戳微博接口续期登录态
+        "keepalive_interval_hours": "12",    # 每个账号的续期间隔（小时）
+        "keepalive_gap_seconds": "30",       # 保活轮内账号之间的间隔
+        "keepalive_max_per_tick": "20",      # 单次 tick 最多处理账号数
+        "cookie_session_ttl_days": "7",      # 服务端 session 经验寿命（微博约 7 天）
+        "cookie_expiry_warn_days": "2",      # 距预计失效几天前预警
+        "cookie_warn_cooldown_hours": "12",  # 同一账号预警最小间隔
     }
     for key, value in defaults.items():
         conn.execute(
@@ -433,7 +482,10 @@ def add_account(data: dict) -> int:
         ),
     )
     conn.commit()
-    return cur.lastrowid
+    account_id = cur.lastrowid
+    on_cookie_replaced(
+        account_id, data.get("cookie") or data.get("cookie_raw") or "")
+    return account_id
 
 
 def update_account(account_id: int, data: dict) -> bool:
@@ -447,6 +499,20 @@ def update_account(account_id: int, data: dict) -> bool:
         pi = fields.pop("proxy_index")
         if pi:
             fields["proxy"] = str(pi)
+
+    # 换了新 cookie（手工粘贴 / 导入 / 扫码覆盖）要把生命周期基准重算，
+    # 否则旧的"上次续期时间"会把新凭据误判成快到期。
+    replaced_cookie = ""
+    if "cookie" in fields or "cookie_raw" in fields:
+        row = conn.execute(
+            f"SELECT {_EFFECTIVE_COOKIE} AS effective FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        old_effective = (row["effective"] if row else "") or ""
+        new_effective = fields.get("cookie") or fields.get("cookie_raw") or old_effective
+        if new_effective and new_effective != old_effective:
+            replaced_cookie = new_effective
+
     sets = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values())
     values.append(_now())
@@ -456,6 +522,8 @@ def update_account(account_id: int, data: dict) -> bool:
         values,
     )
     conn.commit()
+    if replaced_cookie:
+        on_cookie_replaced(account_id, replaced_cookie)
     return True
 
 
@@ -498,6 +566,180 @@ def touch_account_result(account_id: int, status: str, message: str) -> None:
         (status, message, _now(), _now(), account_id),
     )
     conn.commit()
+
+
+# ========================= Cookie 生命周期 =========================
+
+# 保活/回写逻辑可写入的状态列。刻意不并入 update_account 的 allowed 白名单，
+# 否则 PUT /api/accounts/{id} 能把这些内部观测字段当普通字段重置。
+COOKIE_STATE_COLUMNS = (
+    "cookie_expires_at", "cookie_issued_at", "cookie_last_seen_valid_at",
+    "cookie_last_rotated_at", "cookie_last_rotate_keys",
+    "cookie_next_keepalive_at", "cookie_health", "cookie_fail_streak",
+    "cookie_warned_at", "cookie_lifetime_observed_days",
+)
+
+# 账号当前真正生效的那份 cookie（历史上手填/批量导入只写过 cookie_raw）
+_EFFECTIVE_COOKIE = "(CASE WHEN cookie <> '' THEN cookie ELSE cookie_raw END)"
+
+
+def _fmt_time(moment: datetime | None) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S") if moment else ""
+
+
+def _keepalive_interval_hours() -> float:
+    try:
+        value = float(get_setting("keepalive_interval_hours", "12") or 12)
+    except (TypeError, ValueError):
+        return 12.0
+    return min(max(value, 1.0), 72.0)
+
+
+def merge_cookie_strings(old: str, new: str) -> str:
+    """union 合并两份 cookie：新值优先，但绝不丢弃库里已有的字段。"""
+    merged = dict(normalize_cookie(old))
+    for key, value in normalize_cookie(new).items():
+        if value:
+            merged[key] = value
+    return cookie_to_string(merged)
+
+
+def set_cookie_state(account_id: int, **cols) -> bool:
+    """只写 cookie_* 观测列。"""
+    fields = {key: value for key, value in cols.items() if key in COOKIE_STATE_COLUMNS}
+    if not fields:
+        return False
+    conn = _get_conn()
+    sets = ", ".join(f"{key} = ?" for key in fields)
+    values = list(fields.values()) + [_now(), account_id]
+    conn.execute(f"UPDATE accounts SET {sets}, updated_at = ? WHERE id = ?", values)
+    conn.commit()
+    return True
+
+
+def merge_account_cookie(account_id: int, cookie_str: str, *,
+                         meta: dict | None = None,
+                         expected_old: str | None = None) -> bool:
+    """原子地"读-合并-写"账号 cookie。
+
+    - 事务内重新读库再 union，避免并发线程互相覆盖掉对方续到的字段；
+    - expected_old 走 CAS：库里现值已不是我们发请求时读到的那份，说明期间别的
+      线程已经续过一期，此时写回一份更旧的 SUB 反而会把登录态作死，直接放弃；
+    - cookie 与 cookie_raw 始终保持同值（读取侧两者都要看）。
+    """
+    if not cookie_str:
+        return False
+    conn = _get_conn()
+    with _write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                f"SELECT {_EFFECTIVE_COOKIE} AS effective FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            current = row["effective"] or ""
+            merged_str = merge_cookie_strings(current, cookie_str)
+            if not merged_str:
+                conn.rollback()
+                return False
+
+            sets = ["cookie = ?", "cookie_raw = ?"]
+            values: list = [merged_str, merged_str]
+            for key, value in (meta or {}).items():
+                if key in COOKIE_STATE_COLUMNS:
+                    sets.append(f"{key} = ?")
+                    values.append(value)
+            sets.append("updated_at = ?")
+            values.append(_now())
+            values.append(account_id)
+
+            where = "id = ?"
+            if expected_old is not None:
+                where += f" AND {_EFFECTIVE_COOKIE} = ?"
+                values.append(expected_old)
+
+            cur = conn.execute(
+                f"UPDATE accounts SET {', '.join(sets)} WHERE {where}", values
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def on_cookie_replaced(account_id: int, cookie_str: str) -> None:
+    """账号换了全新 cookie（手工粘贴 / 导入 / 扫码登录）后重算生命周期基准。"""
+    now = datetime.now()
+    expires_at = parse_cookie_expiry(cookie_str)
+    set_cookie_state(
+        account_id,
+        cookie_expires_at=_fmt_time(expires_at),
+        cookie_issued_at=_fmt_time(now),
+        cookie_last_seen_valid_at="",
+        cookie_last_rotated_at="",
+        cookie_last_rotate_keys="",
+        cookie_next_keepalive_at=_fmt_time(
+            now + timedelta(hours=_keepalive_interval_hours())),
+        cookie_health="unknown",
+        cookie_fail_streak=0,
+        cookie_warned_at="",
+    )
+
+
+def list_keepalive_due(now: str | None = None, limit: int = 20) -> list[dict]:
+    """取出到保活时间的启用账号；next_at 为空视为"从没排过"，即刻待处理。"""
+    moment = now or _now()
+    try:
+        size = max(int(limit), 1)
+    except (TypeError, ValueError):
+        size = 20
+    rows = _get_conn().execute(
+        f"""
+        SELECT * FROM accounts
+        WHERE enabled = 1
+          AND cookie_health <> 'invalid'
+          AND {_EFFECTIVE_COOKIE} <> ''
+          AND (cookie_next_keepalive_at = '' OR cookie_next_keepalive_at <= ?)
+        ORDER BY CASE WHEN cookie_next_keepalive_at = '' THEN 0 ELSE 1 END,
+                 cookie_next_keepalive_at
+        LIMIT ?
+        """,
+        (moment, size),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_cookie_dead(account_id: int) -> int:
+    """判定登录态已死：停掉保活，并记下这次实测出的 session 寿命供自适应间隔使用。"""
+    acc = get_account(account_id)
+    if not acc:
+        return 0
+    issued = parse_time(acc.get("cookie_issued_at")) or parse_time(acc.get("created_at"))
+    lifetime_days = max((datetime.now() - issued).days, 0) if issued else 0
+    set_cookie_state(
+        account_id,
+        cookie_health="invalid",
+        cookie_next_keepalive_at="",
+        cookie_lifetime_observed_days=lifetime_days,
+    )
+    return lifetime_days
+
+
+def count_cookie_health() -> dict:
+    rows = _get_conn().execute(
+        """
+        SELECT cookie_health AS health, COUNT(*) AS c
+        FROM accounts WHERE enabled = 1 GROUP BY cookie_health
+        """
+    ).fetchall()
+    return {(r["health"] or "unknown"): r["c"] for r in rows}
 
 
 # ========================= 日志 =========================
@@ -798,6 +1040,30 @@ def create_user(username: str, password_hash: str) -> int:
     return cur.lastrowid
 
 
+def try_create_first_user(username: str, password_hash: str) -> int | None:
+    """仅当系统中还不存在任何用户时创建用户（事务内原子判断，杜绝并发双开）。
+
+    返回新用户 id；已存在用户时返回 None。
+    """
+    conn = _get_conn()
+    with _write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            count = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            if count > 0:
+                conn.rollback()
+                return None
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+                (username, password_hash, _now()),
+            )
+            conn.commit()
+            return cur.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def update_user_password(user_id: int, password_hash: str) -> None:
     conn = _get_conn()
     conn.execute(
@@ -825,8 +1091,14 @@ def count_users() -> int:
     return _get_conn().execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
 
 
+def _token_digest(token: str) -> str:
+    """会话 token 只存 SHA-256 摘要：拖库后 token 无法直接复用。"""
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def create_session(token: str, user_id: int, ttl_hours: int = 168) -> None:
-    """创建会话，默认 7 天有效。"""
+    """创建会话，默认 7 天有效。库中仅保存 token 摘要。"""
     from datetime import timedelta
 
     conn = _get_conn()
@@ -835,7 +1107,7 @@ def create_session(token: str, user_id: int, ttl_hours: int = 168) -> None:
     ).strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
         "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        (token, user_id, _now(), expires),
+        (_token_digest(token), user_id, _now(), expires),
     )
     conn.commit()
 
@@ -845,13 +1117,14 @@ def get_session_user(token: str) -> dict | None:
     if not token:
         return None
     conn = _get_conn()
+    digest = _token_digest(token)
     row = conn.execute(
-        "SELECT s.user_id, s.expires_at FROM sessions s WHERE s.token = ?", (token,)
+        "SELECT s.user_id, s.expires_at FROM sessions s WHERE s.token = ?", (digest,)
     ).fetchone()
     if not row:
         return None
     if row["expires_at"] < _now():
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
         conn.commit()
         return None
     # 清理过期会话
@@ -862,13 +1135,83 @@ def get_session_user(token: str) -> dict | None:
 
 def delete_session(token: str) -> None:
     conn = _get_conn()
-    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.execute("DELETE FROM sessions WHERE token = ?", (_token_digest(token),))
     conn.commit()
 
 
 def delete_user_sessions(user_id: int) -> None:
     conn = _get_conn()
     conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
+# ========================= 登录失败限流（持久化） =========================
+
+def login_lock_remaining(ip: str, lock_seconds: int) -> int:
+    """该 IP 剩余锁定秒数；0 表示未锁定。"""
+    if not ip:
+        return 0
+    row = _get_conn().execute(
+        "SELECT locked_until FROM login_locks WHERE ip = ?", (ip,)
+    ).fetchone()
+    if not row:
+        return 0
+    import time
+    remaining = row["locked_until"] - time.time()
+    if remaining <= 0:
+        return 0
+    return int(remaining) + 1
+
+
+def record_login_failure(ip: str, max_fails: int, window_seconds: int,
+                         lock_seconds: int) -> int:
+    """记录一次登录失败；触发锁定则返回锁定秒数，否则 0。"""
+    if not ip:
+        return 0
+    import json
+    import time
+
+    conn = _get_conn()
+    with _write_lock:
+        now = time.time()
+        row = conn.execute(
+            "SELECT fails FROM login_locks WHERE ip = ?", (ip,)
+        ).fetchone()
+        try:
+            hits = [t for t in json.loads(row["fails"]) if now - t < window_seconds]
+        except (TypeError, ValueError):
+            hits = []
+        hits.append(now)
+        if len(hits) >= max_fails:
+            conn.execute(
+                "INSERT INTO login_locks (ip, fails, locked_until) VALUES (?, ?, ?) "
+                "ON CONFLICT(ip) DO UPDATE SET fails = ?, locked_until = ?",
+                (ip, "[]", now + lock_seconds, "[]", now + lock_seconds),
+            )
+            conn.commit()
+            return lock_seconds
+        conn.execute(
+            "INSERT INTO login_locks (ip, fails, locked_until) VALUES (?, ?, 0) "
+            "ON CONFLICT(ip) DO UPDATE SET fails = ?",
+            (ip, json.dumps(hits), json.dumps(hits)),
+        )
+        conn.commit()
+    return 0
+
+
+def reset_login_failures(ip: str) -> None:
+    """登录成功后清掉该 IP 的失败计数与锁定。"""
+    if not ip:
+        return
+    conn = _get_conn()
+    conn.execute("DELETE FROM login_locks WHERE ip = ?", (ip,))
+    conn.commit()
+
+
+def reset_all_login_locks() -> None:
+    """清空全部登录限流状态（测试与运维用途）。"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM login_locks")
     conn.commit()
 
 

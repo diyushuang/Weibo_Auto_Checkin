@@ -8,11 +8,14 @@ import json
 import logging
 import random
 import re
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import requests
+
+from .security import safe_exc, validate_weibo_url
 
 log = logging.getLogger("weibo.client")
 
@@ -48,6 +51,44 @@ _RETRYABLE = (
     requests.exceptions.ReadTimeout,
     requests.exceptions.SSLError,
 )
+
+# 单端点最大翻页数，限制请求放大
+MAX_TOPIC_PAGES = 3
+
+# ========================= Session 复用 =========================
+
+_thread_sessions = threading.local()
+
+
+def get_thread_session() -> requests.Session:
+    """线程本地复用的 Session（用于公开接口，减少 TLS 握手开销）。
+
+    账号级 Cookie 一律通过请求参数传入；复用前清空 Cookie jar，
+    避免上一个账号的响应 Set-Cookie 混入下一个账号的请求。
+    """
+    session = getattr(_thread_sessions, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update(HEADERS)
+        _thread_sessions.session = session
+    session.cookies.clear()
+    return session
+
+
+def new_account_session() -> requests.Session:
+    """账号专属 Session：登录态请求必须独占 jar，才能回收本次响应的 Set-Cookie。
+
+    不要改成复用 get_thread_session() —— 它复用前会清空 jar，轮换凭证会被抹掉。
+    """
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(HEADERS)
+    return session
 
 # ========================= 超话页面（v1.3.0） =========================
 
@@ -363,27 +404,31 @@ def fetch_topic_posts(session, cookies, containerid: str, channel="auto",
                 params["page"] = page
             if since_id:
                 params["since_id"] = since_id
-            old_headers = dict(session.headers)
             try:
-                # 合并自定义 headers（请求后无论成败都恢复，避免污染后续端点）
-                session.headers.update(ep.get("headers", {}))
+                # 端点专属 headers 走请求级参数，避免污染 session 级配置
                 payload = request_json(
                     session, "GET", ep["url"], params=params, cookies=cookies,
+                    headers=ep.get("headers") or None,
                     channel=channel, proxy=proxy, force=force,
                     allow_fallback=allow_fallback,
                 )
             except NetworkError as exc:
-                errors.append(f"[{tried}] {ep['url']} p{page}: 网络错误 {exc}")
+                errors.append(f"[{tried}] {ep['url']} p{page}: 网络错误 {safe_exc(exc)}")
+                break
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "?"
+                if status == 432:
+                    # 微博风控拦截：通常是无/低可信 Cookie 触发
+                    errors.append(f"[{tried}] {ep['url']} p{page}: 微博风控拦截(432)")
+                else:
+                    errors.append(f"[{tried}] {ep['url']} p{page}: 请求失败 {safe_exc(exc)}")
                 break
             except RuntimeError as exc:
-                errors.append(f"[{tried}] {ep['url']} p{page}: 请求失败 {exc}")
+                errors.append(f"[{tried}] {ep['url']} p{page}: 请求失败 {safe_exc(exc)}")
                 break
             except Exception as exc:
-                errors.append(f"[{tried}] {ep['url']} p{page}: 未知错误 {exc}")
+                errors.append(f"[{tried}] {ep['url']} p{page}: 未知错误 {safe_exc(exc)}")
                 break
-            finally:
-                session.headers.clear()
-                session.headers.update(old_headers)
 
             # 检查响应状态（PC 端没有 ok 字段，直接有 items）
             if "items" in payload:
@@ -393,7 +438,9 @@ def fetch_topic_posts(session, cookies, containerid: str, channel="auto",
                 # 移动端格式，检查 ok
                 ok_val = payload.get("ok")
                 if ok_val == -100:
-                    errors.append(f"[{tried}] {ep['url']} p{page}: Cookie 过期")
+                    # 带 Cookie 时 -100 是登录态失效；不带 Cookie 则是微博要求登录
+                    detail = "Cookie 过期" if cookies else "微博要求登录（匿名访问已关闭）"
+                    errors.append(f"[{tried}] {ep['url']} p{page}: {detail}")
                     break
                 if ok_val != 1 and ok_val != "1":
                     log.warning(f"fetch_topic_posts: ok={ok_val!r}, url={ep['url']}, page={page}")
@@ -408,7 +455,7 @@ def fetch_topic_posts(session, cookies, containerid: str, channel="auto",
             if len(posts) >= count:
                 break
 
-            # 翻页
+            # 翻页：since_id 优先，否则用 page 递增；两种方式都受 MAX_TOPIC_PAGES 约束
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             cardlist_info = data.get("cardlistInfo") if isinstance(data.get("cardlistInfo"), dict) else {}
             next_since = cardlist_info.get("since_id", "")
@@ -416,8 +463,8 @@ def fetch_topic_posts(session, cookies, containerid: str, channel="auto",
                 since_id = next_since
             else:
                 page += 1
-                if page > 3:
-                    break
+            if page > MAX_TOPIC_PAGES:
+                break
             time.sleep(0.3)
 
         if posts:
@@ -443,6 +490,14 @@ def fetch_topic_posts(session, cookies, containerid: str, channel="auto",
 
 class NetworkError(RuntimeError):
     """整遍网络层失败。"""
+
+
+class CookieExpiredError(RuntimeError):
+    """微博接口明确判定登录态已失效（区别于网络失败与接口抖动）。"""
+
+
+class RateLimitedError(NetworkError):
+    """微博风控/限流（HTTP 429、432）。是网络类失败，但不能当成登录过期。"""
 
 
 # ========================= Cookie 工具 =========================
@@ -472,6 +527,147 @@ def normalize_cookie(raw) -> dict:
 def cookie_to_string(cookie_dict: dict) -> str:
     """dict Cookie 转回字符串，便于回写。"""
     return "; ".join(f"{k}={v}" for k, v in cookie_dict.items() if v)
+
+
+# 微博登录态的真实凭据：SUB 单独存在不算登录（m.weibo.cn 会给未登录访客
+# 下发一个"假 SUB"），必须再带上三者之一。
+REAL_LOGIN_KEYS = ("SCF", "SSOLoginState", "ALF")
+# 值得回写的字段：微博轮换/补发这些 key 说明登录态在续期。
+ROTATE_CRITICAL_KEYS = ("SUB", "SUBP", "MLOGIN") + REAL_LOGIN_KEYS
+
+
+def is_real_login(cookies: dict) -> bool:
+    """是否具备真实登录凭据（而非匿名访客的裸 SUB）。"""
+    return bool(cookies.get("SUB")) and any(cookies.get(key) for key in REAL_LOGIN_KEYS)
+
+
+def harvest_cookie_rotation(session, base: dict) -> tuple[dict, list, list]:
+    """合并响应里的 Set-Cookie，返回 (合并结果, 值变化的 key, 本次新增的 key)。
+
+    微博会在登录态有效期内轮换 SUB/SUBP、并按需补发缺失的 SCF 等字段；
+    把这些变化持久化下去，登录态才能自我续期。
+    """
+    merged = dict(base)
+    changed: list[str] = []
+    added: list[str] = []
+    for cookie in session.cookies:
+        if not cookie.value:
+            continue
+        if cookie.name not in base:
+            added.append(cookie.name)
+        elif base[cookie.name] != cookie.value:
+            changed.append(cookie.name)
+        merged[cookie.name] = cookie.value
+    return merged, list(dict.fromkeys(changed)), list(dict.fromkeys(added))
+
+
+def cookie_diff_gate(changed: list, added: list) -> bool:
+    """是否需要把合并结果回写数据库。
+
+    只认同名 key 的变化会漏掉微博补发的登录凭据（库里那份永远缺 SCF 就再也
+    补不回来）；但也不能让微博顺带下发的无关 cookie 污染库，所以新增字段
+    只在命中登录关键字段时才触发回写。
+    """
+    if changed:
+        return True
+    return any(key in ROTATE_CRITICAL_KEYS for key in added)
+
+
+def reject_cookie_shrink(base: dict, merged: dict) -> str | None:
+    """合并结果丢了登录凭据时给出拒绝原因，避免把一次脏响应写回库里判死账号。"""
+    if base.get("SUB") and not merged.get("SUB"):
+        return "合并结果丢失 SUB"
+    if any(base.get(key) for key in REAL_LOGIN_KEYS) and \
+            not any(merged.get(key) for key in REAL_LOGIN_KEYS):
+        return "合并结果丢失全部登录关键字段"
+    return None
+
+
+def parse_cookie_expiry(raw_cookie) -> datetime | None:
+    """解析 cookie 中的 ALF（account login expire time，秒级时间戳）。
+
+    ALF 常写着一年，而服务端 session 实际约 7 天就失效，所以它只是"名义到期"，
+    预警以 observed_deadline 为准。
+    """
+    cookies = normalize_cookie(raw_cookie)
+    raw = str(cookies.get("ALF") or "").strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    if value > 10_000_000_000:  # 毫秒时间戳
+        value //= 1000
+    if value < 1_000_000_000:   # 2001 年以前，判定为脏值
+        return None
+    try:
+        return datetime.fromtimestamp(value)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def parse_time(value) -> datetime | None:
+    """解析库里的字符串时间（_now() 格式），失败返回 None。"""
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def describe_cookie_lifespan(acc: dict, *, ttl_days: int = 7,
+                             warn_days: float = 2,
+                             now: datetime | None = None) -> dict:
+    """综合 ALF 名义到期与经验 session 寿命，给出到期视图。
+
+    取多把尺子里最早的那个作为 deadline：ALF 常写着一年，而微博实测在登录后约
+    7 天就吊销服务端 session。特别注意不能只以"上次探活成功"为基准 —— 每轮保活
+    都会把那个时钟归零，于是永远报不出"即将失效"；凭证录入时间（cookie_issued_at）
+    才是那把不会退休的尺子。
+    """
+    now = now or datetime.now()
+    alf_at = parse_cookie_expiry(acc.get("cookie") or acc.get("cookie_raw") or "")
+
+    horizon = timedelta(days=max(ttl_days, 1))
+    candidates = []
+    for key in ("cookie_issued_at", "cookie_last_rotated_at", "cookie_last_seen_valid_at"):
+        anchor = parse_time(acc.get(key))
+        if anchor:
+            candidates.append(anchor + horizon)
+    observed_at = min(candidates) if candidates else None
+
+    every_one = [dt for dt in (alf_at, observed_at) if dt]
+    deadline = min(every_one) if every_one else None
+
+    days_left = round((deadline - now).total_seconds() / 86400, 2) if deadline else None
+    if deadline is None:
+        state = "unknown"
+        reason = "缺少 ALF 与续期记录，无法估算到期"
+    elif days_left <= 0:
+        state = "expired"
+        reason = "按已有记录已到预计失效时间"
+    elif days_left <= warn_days:
+        state = "expiring"
+        reason = f"预计 {days_left:g} 天后失效"
+    else:
+        state = "ok"
+        reason = f"预计还能用 {days_left:g} 天"
+
+    return {
+        "alf_expires_at": alf_at.strftime("%Y-%m-%d %H:%M:%S") if alf_at else "",
+        "observed_deadline": observed_at.strftime("%Y-%m-%d %H:%M:%S") if observed_at else "",
+        "deadline": deadline.strftime("%Y-%m-%d %H:%M:%S") if deadline else "",
+        "days_left": days_left,
+        "state": state,
+        "reason": reason,
+    }
 
 
 # ========================= 代理 =========================
@@ -526,11 +722,12 @@ def request_via_proxy(session, method, url, channel="auto", proxy=None,
         try:
             return session.request(method, url, **pk)
         except _RETRYABLE as exc:
+            # 异常文本可能携带 socks5://user:pass@host 完整代理 URL，必须脱敏
             if channel == "socks":
-                raise NetworkError(f"socks 代理请求失败：{exc}") from exc
+                raise NetworkError(f"socks 代理请求失败：{safe_exc(exc)}") from exc
             if force or not allow_fallback:
-                raise NetworkError(f"socks 代理请求失败：{exc}") from exc
-            log.warning("socks 代理失败（%s），回退直连", exc)
+                raise NetworkError(f"socks 代理请求失败：{safe_exc(exc)}") from exc
+            log.warning("socks 代理失败（%s），回退直连", safe_exc(exc))
         except Exception:
             raise
 
@@ -567,11 +764,19 @@ def verify_cookie(session, cookies, channel="auto", proxy=None,
         return bool(data.get("login")), data.get("st")
     except NetworkError:
         raise
+    except requests.exceptions.HTTPError as exc:
+        status = getattr(exc.response, "status_code", 0)
+        if status in (429, 432):
+            # 风控要用限流身份上报：按"网络失败"处理会退避重试，
+            # 按"登录过期"处理又会把好好的账号误判死、催用户重新扫码。
+            raise RateLimitedError(f"微博风控拦截（HTTP {status}）") from exc
+        raise NetworkError(f"验证 Cookie 请求失败：HTTP {status}") from exc
     except requests.exceptions.RequestException as exc:
-        raise NetworkError(f"验证 Cookie 网络失败：{exc}") from exc
+        raise NetworkError(f"验证 Cookie 网络失败：{safe_exc(exc)}") from exc
     except Exception as exc:
-        log.warning("验证 Cookie 失败：%s", exc)
-        return False, None
+        # 解析错误等瞬时异常不能误判为"未登录"（会导致账号被错误标记
+        # cookie_invalid、要求重新扫码），统一按网络类失败上抛。
+        raise NetworkError(f"验证 Cookie 响应异常：{safe_exc(exc)}") from exc
 
 
 def _normalize_topic_id(raw_id: str) -> str:
@@ -603,6 +808,10 @@ def get_followed_topics(session, cookies, channel="auto", proxy=None,
             # 不要把登录过期、风控或微博接口错误误报成「没有关注超话」。
             detail = payload.get("msg") or payload.get("errmsg") or payload.get("error") or ok_val
             if not topics:
+                if str(ok_val) == "-100":
+                    # 微博用 ok=-100 表示登录态已失效，要和接口抖动区分开，
+                    # 否则 cookie 过期会被误标成普通失败、不提示重新登录。
+                    raise CookieExpiredError(f"Cookie 已失效，微博要求重新登录：{detail}")
                 raise RuntimeError(f"微博未能返回关注超话列表：{detail}")
             log.warning("关注超话翻页提前结束：%s", detail)
             break
@@ -724,6 +933,9 @@ def checkin_topic(session, cookies, scheme, st, channel="auto", proxy=None,
     if not scheme:
         raise RuntimeError("缺少签到链接 scheme")
     url = scheme if scheme.startswith("http") else BASE + scheme
+    # scheme 来自微博接口响应，属不可信输入：绝对 URL 只允许微博自家 host，
+    # 并拒绝私有/保留地址，防止账号 Cookie 被发往任意外部主机。
+    url = validate_weibo_url(url)
     separator = "&" if "?" in url else "?"
     return request_json(
         session, "GET", f"{url}{separator}st={st}", cookies=cookies,
@@ -732,15 +944,9 @@ def checkin_topic(session, cookies, scheme, st, channel="auto", proxy=None,
 
 
 def merge_refreshed_cookies(session, cookie_dict: dict) -> tuple[dict, list]:
-    """合并响应中的 Set-Cookie，返回 (新dict, 变化的key列表)。"""
-    merged = dict(cookie_dict)
-    changed = []
-    for cookie in session.cookies:
-        if not cookie.value:
-            continue
-        if cookie.name in cookie_dict and cookie_dict[cookie.name] != cookie.value:
-            changed.append(cookie.name)
-        merged[cookie.name] = cookie.value
+    """已废弃：只报告同名 key 的变化，会漏掉微博补发的登录凭据。
+    新代码用 harvest_cookie_rotation + cookie_diff_gate。"""
+    merged, changed, _added = harvest_cookie_rotation(session, cookie_dict)
     return merged, changed
 
 
@@ -759,9 +965,16 @@ class CheckinOptions:
 
     @classmethod
     def from_settings(cls, db_get):
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(db_get(key, str(default)) or default)
+            except (TypeError, ValueError):
+                log.warning("设置 %s 值损坏，回退默认 %s", key, default)
+                return default
+
         return cls(
-            checkin_delay_min=int(db_get("checkin_delay_min", "3") or 3),
-            checkin_delay_max=int(db_get("checkin_delay_max", "8") or 8),
+            checkin_delay_min=_int("checkin_delay_min", 3),
+            checkin_delay_max=_int("checkin_delay_max", 8),
             proxies=parse_proxies(db_get("proxies", "")),
             proxy_force=db_get("proxy_force", "0") == "1",
             proxy_fallback=db_get("proxy_fallback", "1") != "0",
@@ -786,23 +999,25 @@ def run_account_checkin(cookie_dict: dict, opts: CheckinOptions,
         proxy = opts.proxies[proxy_index % len(opts.proxies)]
         channel = "socks"
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = new_account_session()
 
     try:
         logged_in, st = verify_cookie(
             session, cookie_dict, channel=channel, proxy=proxy,
             force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
         )
+    except RateLimitedError as exc:
+        return _bundle("failed", f"验证 Cookie 被风控：{safe_exc(exc)}", 0, 0, 0, [],
+                       cookie_dict, [], channel, failure_type="rate_limited")
     except NetworkError as exc:
-        return _bundle("failed", f"验证 Cookie 网络失败：{exc}", 0, 0, 0, [],
+        return _bundle("failed", f"验证 Cookie 网络失败：{safe_exc(exc)}", 0, 0, 0, [],
                        cookie_dict, [], channel, failure_type="network")
 
     if not logged_in:
-        merged, changed = merge_refreshed_cookies(session, cookie_dict)
+        merged, changed, added = harvest_cookie_rotation(session, cookie_dict)
         return _bundle("failed", "Cookie 无效或已过期，请重新登录", 0, 0, 0,
                        [], merged, changed, channel,
-                       failure_type="cookie_invalid")
+                       failure_type="cookie_invalid", cookie_added=added)
 
     try:
         topics = get_followed_topics(
@@ -810,13 +1025,20 @@ def run_account_checkin(cookie_dict: dict, opts: CheckinOptions,
             force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
         )
     except NetworkError as exc:
-        return _bundle("failed", f"获取超话列表网络失败：{exc}", 0, 0, 0, [],
+        return _bundle("failed", f"获取超话列表网络失败：{safe_exc(exc)}", 0, 0, 0, [],
                        cookie_dict, [], channel)
+    except CookieExpiredError as exc:
+        return _bundle("failed", f"Cookie 已失效：{safe_exc(exc)}", 0, 0, 0, [],
+                       cookie_dict, [], channel, failure_type="cookie_invalid")
+    except RuntimeError as exc:
+        # 列表接口的其它异常不能再冒泡：一个账号的接口抖动会中断整批签到。
+        return _bundle("failed", f"获取超话列表失败：{safe_exc(exc)}", 0, 0, 0, [],
+                       cookie_dict, [], channel, failure_type="topics_list_error")
 
     if not topics:
-        merged, changed = merge_refreshed_cookies(session, cookie_dict)
+        merged, changed, added = harvest_cookie_rotation(session, cookie_dict)
         return _bundle("success", "没有关注超话", 0, 0, 0, [],
-                       merged, changed, channel)
+                       merged, changed, channel, cookie_added=added)
 
     results = []
     total = len(topics)
@@ -838,7 +1060,13 @@ def run_account_checkin(cookie_dict: dict, opts: CheckinOptions,
                     force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
                 )
                 if not logged_in:
-                    raise RuntimeError("Cookie 在签到过程中失效")
+                    # 登录态中途死亡要立刻收尾：继续拿旧 SUB 逐个撞接口只会加重风控，
+                    # 而且这类失败必须标成 cookie_invalid，否则 TG 不会提示重新登录。
+                    merged, changed, added = harvest_cookie_rotation(session, cookie_dict)
+                    done = sum(1 for r in results if r["success"])
+                    return _bundle("failed", "Cookie 在签到过程中失效", total, done,
+                                   total - done, results, merged, changed, channel,
+                                   failure_type="cookie_invalid", cookie_added=added)
                 response = checkin_topic(
                     session, cookie_dict, topic["scheme"], st,
                     channel=channel, proxy=proxy,
@@ -863,23 +1091,24 @@ def run_account_checkin(cookie_dict: dict, opts: CheckinOptions,
                              topic["name"], resp_text)
             results.append(entry)
         except NetworkError:
-            merged, changed = merge_refreshed_cookies(session, cookie_dict)
+            merged, changed, added = harvest_cookie_rotation(session, cookie_dict)
             return _bundle("failed", "签到过程中网络失败", total,
                            sum(1 for r in results if r["success"]),
                            len(results) - sum(1 for r in results if r["success"]),
-                           results, merged, changed, channel)
+                           results, merged, changed, channel, cookie_added=added)
         except Exception as exc:
             results.append({"name": topic["name"], "success": False,
-                            "message": str(exc)})
+                            "message": safe_exc(exc)})
         if idx < total:
             time.sleep(random.uniform(opts.checkin_delay_min, opts.checkin_delay_max))
 
-    merged, changed = merge_refreshed_cookies(session, cookie_dict)
+    merged, changed, added = harvest_cookie_rotation(session, cookie_dict)
     success_count = sum(1 for r in results if r["success"])
     fail_count = total - success_count
     status = "success" if fail_count == 0 else "partial"
     return _bundle(status, _checkin_summary_message(results), total,
-                   success_count, fail_count, results, merged, changed, channel)
+                   success_count, fail_count, results, merged, changed, channel,
+                   cookie_added=added)
 
 
 def _checkin_summary_message(results: list) -> str:
@@ -900,7 +1129,8 @@ def _checkin_summary_message(results: list) -> str:
 
 
 def _bundle(status, message, total, success, fail, results, cookie,
-            cookie_changed, channel="direct", failure_type=None):
+            cookie_changed, channel="direct", failure_type=None,
+            cookie_added=None):
     return {
         "status": status,
         "message": message,
@@ -910,6 +1140,7 @@ def _bundle(status, message, total, success, fail, results, cookie,
         "results": results,
         "cookie": cookie,
         "cookie_changed": cookie_changed,
+        "cookie_added": cookie_added or [],
         "channel": channel,
         "failure_type": failure_type,
     }

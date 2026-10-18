@@ -107,6 +107,7 @@
                 <button class="btn btn-ghost btn-sm" id="btn-batch-import">📥 批量导入</button>
                 <button class="btn btn-ghost btn-sm" id="btn-import">📂 文件导入</button>
                 <button class="btn btn-ghost btn-sm" id="btn-export">📤 导出</button>
+                <button class="btn btn-ghost btn-sm" id="btn-keepalive-all" title="对到期账号各发一次认证请求，续期 Cookie">🍪 全部保活</button>
               </div>
             </div>
           </div>
@@ -116,7 +117,7 @@
             <button class="btn btn-ghost btn-sm" id="btn-sel-disable">停用选中</button>
             <button class="btn btn-ghost btn-sm" id="btn-sel-clear">清空选择</button>
           </div>
-          <div class="table-wrap"><table id="accTable"><thead><tr><th style="width:34px"><input type="checkbox" id="accCheckAll" title="全选" /></th><th>名称</th><th>状态</th><th>Cookie</th><th>代理</th><th>上次签到</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+          <div class="table-wrap"><table id="accTable"><thead><tr><th style="width:34px"><input type="checkbox" id="accCheckAll" title="全选" /></th><th>名称</th><th>状态</th><th>Cookie</th><th>Cookie 有效期</th><th>代理</th><th>上次签到</th><th>操作</th></tr></thead><tbody></tbody></table></div>
         </div>
       </section>
 
@@ -283,6 +284,44 @@
               <div class="settings-row">
                 <div class="settings-label"><label for="s-proxy_fallback">失败回退直连</label><small>代理不通时自动尝试直连</small></div>
                 <label class="switch"><input type="checkbox" id="s-proxy_fallback" checked /><span class="switch-slider"></span></label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Cookie 保活 -->
+          <div class="settings-section">
+            <div class="settings-section-head">
+              <span class="settings-section-ico">🍪</span>
+              <h2>Cookie 保活</h2>
+            </div>
+            <div class="settings-section-body">
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_enabled">启用定时保活</label><small>定期用 Cookie 请求微博接口，把轮换的新凭证续下来</small></div>
+                <label class="switch"><input type="checkbox" id="s-keepalive_enabled" /><span class="switch-slider"></span></label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_interval_hours">续期间隔</label><small>小时；按实测寿命会自动加密，签到时段的保活会自动让路</small></div>
+                <input id="s-keepalive_interval_hours" class="input-modern" type="number" min="1" max="72" placeholder="12" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-cookie_session_ttl_days">经验寿命</label><small>天；服务端 session 实际能活多久（微博通常约 7 天）</small></div>
+                <input id="s-cookie_session_ttl_days" class="input-modern" type="number" min="1" max="60" placeholder="7" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-cookie_expiry_warn_days">提前预警</label><small>距预计失效不足几天时推送 TG</small></div>
+                <input id="s-cookie_expiry_warn_days" class="input-modern" type="number" min="0" max="7" placeholder="2" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-cookie_warn_cooldown_hours">预警冷却</label><small>同一账号两次提醒的最小间隔，避免刷屏</small></div>
+                <input id="s-cookie_warn_cooldown_hours" class="input-modern" type="number" min="1" max="72" placeholder="12" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_gap_seconds">账号间隔</label><small>保活轮内两个账号之间的等待秒数</small></div>
+                <input id="s-keepalive_gap_seconds" class="input-modern" type="number" min="0" max="300" placeholder="30" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_max_per_tick">单次上限</label><small>一轮最多处理多少个账号，其余下轮继续</small></div>
+                <input id="s-keepalive_max_per_tick" class="input-modern" type="number" min="1" max="200" placeholder="20" />
               </div>
             </div>
           </div>

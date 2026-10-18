@@ -6,19 +6,31 @@
   <title>登录 · 微博签到管理面板</title>
   <link rel="stylesheet" href="/style.css" />
   <style>
-    .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;
+    .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;
       background:linear-gradient(160deg,var(--bg) 0%,color-mix(in srgb,var(--accent-soft) 55%,var(--bg)) 100%)}
-    .login-card{width:360px;max-width:92vw;background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:34px 30px;box-shadow:0 20px 50px rgba(0,0,0,.12);animation:loginIn .4s ease}
-    @keyframes loginIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+    /* 背景装饰光斑 + 细点阵 */
+    .login-wrap::before{content:"";position:absolute;inset:0;pointer-events:none;
+      background:
+        radial-gradient(420px 420px at 12% 18%, rgba(var(--accent-rgb),.14), transparent 70%),
+        radial-gradient(520px 520px at 88% 78%, rgba(var(--accent-rgb),.10), transparent 70%),
+        radial-gradient(rgba(var(--accent-rgb),.05) 1px, transparent 1px);
+      background-size:auto,auto,24px 24px}
+    .login-card{position:relative;z-index:1;width:360px;max-width:92vw;background:color-mix(in srgb,var(--surface) 88%,transparent);
+      backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);
+      border:1px solid color-mix(in srgb,var(--line) 80%,transparent);border-radius:20px;padding:36px 32px;
+      box-shadow:0 24px 64px rgba(16,24,40,.14),0 4px 16px rgba(16,24,40,.06),inset 0 1px 0 rgba(255,255,255,.6);
+      animation:loginIn .45s cubic-bezier(.2,.8,.2,1)}
+    @keyframes loginIn{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:none}}
     .login-brand{display:flex;align-items:center;gap:12px;margin-bottom:24px}
-    .login-brand .logo{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),#ff6b8f);color:var(--accent-ink);font-weight:800;font-size:19px;box-shadow:0 6px 16px rgba(var(--accent-rgb),.35)}
-    .login-brand h1{margin:0;font-size:18px}
+    .login-brand .logo{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;background:var(--grad);color:var(--accent-ink);font-weight:800;font-size:19px;box-shadow:0 6px 18px rgba(var(--accent-rgb),.4),inset 0 1px 0 rgba(255,255,255,.25)}
+    .login-brand h1{margin:0;font-size:18px;letter-spacing:-.2px}
     .login-brand p{margin:2px 0 0;color:var(--muted);font-size:12px}
     .login-card label{display:block;font-size:13px;color:var(--muted);font-weight:600;margin:14px 0 6px}
-    .login-card input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface-2);color:var(--ink);font:inherit;outline:none;transition:border .18s,box-shadow .18s}
+    .login-card input{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);font:inherit;outline:none;transition:border .18s,box-shadow .18s;box-shadow:inset 0 1px 2px rgba(16,24,40,.03)}
     .login-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(var(--accent-rgb),.15)}
     .login-card .btn{width:100%;margin-top:22px;padding:11px}
     .login-err{color:var(--danger);font-size:13px;margin-top:10px;min-height:18px}
+    .login-foot{margin-top:18px;text-align:center;color:var(--muted);font-size:11px;opacity:.75}
   </style>
 </head>
 <body>
@@ -37,6 +49,7 @@
     <input type="password" id="password" autocomplete="current-password" required />
     <button class="btn btn-primary" type="submit" id="loginBtn">登 录</button>
     <div class="login-err" id="err"></div>
+    <div class="login-foot">微博超话签到管理面板</div>
   </form>
 </div>
 <script>
