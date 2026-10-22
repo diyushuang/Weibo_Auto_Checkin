@@ -8,6 +8,7 @@
 - 🔐 **登录保护**：首次部署可视化初始化设置管理员；未登录拦截；改密 / 退出
 - 📱 **微博扫码添加账号**：弹二维码 → 微博 App 扫码确认 → 自动获取 Cookie
 - 🍪 **Cookie 生成器**：粘贴 Cookie 自动解析，一键导入账号
+- 🕓 **Cookie 智能保活**：自适应间隔 + 随机抖动 + 临期自动加密 + 真实业务流量掺入 + 夜间静默，尽量把登录态续得更久
 - ⏰ **自动定时签到**：Cron 可配（支持 5 段 / 6 段青龙格式）
 - ✅ **已签自动跳过**：不重复签到
 - 🛡️ **防封策略**：凌晨窗口随机等待、SOCKS5 代理池、失败回退、三遍重试
@@ -15,6 +16,7 @@
 - 📲 **Telegram 推送**：签到完成自动推送汇总
 - 📜 **分组日志**：按日期分区，单次执行的所有账号归并一组
 - 🗄️ **SQLite**：账号 / 日志 / 任务 / 用户 / 通知全部持久化
+- 🧰 **极简 CLI 模式**：`mini_client.py` 与面板同库的命令行入口（签到/保活/超话），cron/青龙友好
 - 🐳 **Docker 一键部署**
 
 ## 🚀 快速部署
@@ -98,6 +100,39 @@ docker compose up -d --build
 docker buildx build --platform linux/amd64,linux/arm64 -t weibo-checkin:multi .
 ```
 
+## 🧰 极简 CLI（无面板模式）
+
+不想开面板？仓库根目录的 `mini_client.py` 与面板**共享同一个 SQLite 数据库**
+和全部业务逻辑（签到编排、保活引擎、超话抓取、扫码导入的账号），只多提供
+一个命令行入口，额外零依赖：
+
+```bash
+cp mini_accounts.example.txt mini_accounts.txt   # 填入你的 cookie
+python mini_client.py import                     # 导入账号文件进数据库
+python mini_client.py checkin                    # 全部启用账号签到一轮
+python mini_client.py keepalive                  # 到期账号保活（--force 立即全量）
+python mini_client.py topics refresh             # 抓取关注超话并更新缓存
+python mini_client.py topics list                # 查看超话缓存
+python mini_client.py checkin --json             # 机器可读输出
+```
+
+- 账号文件支持 `cookie` / `名字|cookie` / `名字|socks5代理|cookie` 三种格式；
+  重复导入按 SUB/名称去重更新，不会产生重复账号
+- 换发到的新 cookie 直接写回数据库，面板健康徽章、日志、超话页全部可见
+- 面板「设置」里的保活间隔、夜间静默、防封等配置对 CLI 同样生效
+- 旧版 `mini_state.json` 会在首次运行时自动迁移进数据库并改名 `.migrated`
+- 面板与 CLI 可共用同一数据库；Cookie 并发写入有 CAS 保护
+
+cron 示例：
+
+```cron
+0 7,19 * * *  cd /path/to/repo && python mini_client.py keepalive --force
+30 7 * * *    cd /path/to/repo && python mini_client.py checkin
+```
+
+退出码：`0` 成功/部分成功/网络抖动；`1` 有账号签到失败或登录失效；
+`2` 配置错误。适合接 cron / 青龙 / systemd timer 的告警链路。
+
 ## 🎯 使用
 
 1. 初始化/登录面板
@@ -121,7 +156,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t weibo-checkin:multi .
 ## 🧪 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -v   # 172 个测试
+.venv/bin/python -m pytest tests/ -v   # 191 个测试
 node tests/frontend-render.test.js      # 前端渲染测试（自动装 jsdom）
 ```
 
@@ -130,6 +165,8 @@ node tests/frontend-render.test.js      # 前端渲染测试（自动装 jsdom�
 ```
 weibo-checkin-manager/
 ├── run.py            # 本地启动
+├── mini_client.py    # 极简 CLI（与面板同库：签到/保活/超话/导入）
+├── mini_accounts.example.txt  # CLI 账号文件模板（复制为 mini_accounts.txt）
 ├── install.sh        # 用户一键安装/更新/管理（推荐）
 ├── compose.prod.yml  # 生产 compose（仅拉镜像运行）
 ├── Dockerfile        # 多阶段构建（amd64/arm64，非 root 运行）
@@ -137,6 +174,9 @@ weibo-checkin-manager/
 │   ├── main.py       # FastAPI 入口 + 认证中间件 + 安全响应头
 │   ├── security.py   # 凭据脱敏 + SSRF 出站守卫
 │   ├── weibo_client.py
+│   ├── cookie_lifecycle.py  # Cookie 健康度/自适应保活/换发回写（唯一实现）
+│   ├── accounts_service.py  # 账号 upsert 与行解析（唯一实现）
+│   ├── topics_service.py    # 超话列表抓取与缓存（唯一实现）
 │   ├── proxy_geo.py  # SOCKS5 代理归属地识别（HTTPS 服务并发探测）
 │   ├── scheduler.py  # 定时 + 防封 + 分组并行调度
 │   ├── notifier.py   # TG 推送
@@ -156,6 +196,7 @@ weibo-checkin-manager/
 |---|---|
 | [v1.3.2](https://github.com/diyushuang/Weibo_Auto_Checkin/releases/tag/v1.3.2) | 安全加固（登录限流、PBKDF2 口令哈希、SSRF 守卫与响应脱敏）、Cookie 健康度体系（到期预警 / 保活续期 / 轮换记录）、主题美化 |
 | [v1.3.3](https://github.com/diyushuang/Weibo_Auto_Checkin/releases/tag/v1.3.3) | WebUI 设计令牌化重构（统一间距 / 字阶 / 圆角体系）、设置页与仪表盘布局重组、组件精修与响应式优化 |
+| [v1.3.4](https://github.com/diyushuang/Weibo_Auto_Checkin/releases/tag/v1.3.4) | 业务逻辑分层（cookie_lifecycle / accounts_service / topics_service 三处唯一实现，API 与 CLI 同源）、Cookie 保活增强（临期加密、随机抖动、业务端点掺入、夜间静默、换发来源记录）、新增 mini_client.py 极简 CLI |
 
 ## 📄 License
 

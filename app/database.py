@@ -76,6 +76,7 @@ def init_db() -> None:
             cookie_last_seen_valid_at     TEXT    NOT NULL DEFAULT '',  -- 上次确认登录态有效
             cookie_last_rotated_at        TEXT    NOT NULL DEFAULT '',  -- 上次成功换发回写
             cookie_last_rotate_keys       TEXT    NOT NULL DEFAULT '',  -- 上次换发变化的 key
+            cookie_last_rotate_source     TEXT    NOT NULL DEFAULT '',  -- 上次换发来源端点（keepalive/config 等）
             cookie_next_keepalive_at      TEXT    NOT NULL DEFAULT '',  -- 下次保活时间
             cookie_health                 TEXT    NOT NULL DEFAULT 'unknown', -- ok/expiring/stale/invalid/network_error/rate_limited/unknown
             cookie_fail_streak            INTEGER NOT NULL DEFAULT 0,   -- 连续保活失败次数（退避用）
@@ -231,6 +232,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "cookie_last_seen_valid_at": "TEXT NOT NULL DEFAULT ''",
         "cookie_last_rotated_at": "TEXT NOT NULL DEFAULT ''",
         "cookie_last_rotate_keys": "TEXT NOT NULL DEFAULT ''",
+        "cookie_last_rotate_source": "TEXT NOT NULL DEFAULT ''",
         "cookie_next_keepalive_at": "TEXT NOT NULL DEFAULT ''",
         "cookie_health": "TEXT NOT NULL DEFAULT 'unknown'",
         "cookie_fail_streak": "INTEGER NOT NULL DEFAULT 0",
@@ -299,6 +301,8 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
         # ---- Cookie 保活与到期预警 ----
         "keepalive_enabled": "1",            # 定时戳微博接口续期登录态
         "keepalive_interval_hours": "12",    # 每个账号的续期间隔（小时）
+        "keepalive_urgent_interval_hours": "6",  # 临近预计失效时的加密续期间隔
+        "keepalive_quiet_hours": "0-6",       # 深夜静默时段（如 0-6；off 关闭），保活别 24 小时在线
         "keepalive_gap_seconds": "30",       # 保活轮内账号之间的间隔
         "keepalive_max_per_tick": "20",      # 单次 tick 最多处理账号数
         "cookie_session_ttl_days": "7",      # 服务端 session 经验寿命（微博约 7 天）
@@ -575,6 +579,7 @@ def touch_account_result(account_id: int, status: str, message: str) -> None:
 COOKIE_STATE_COLUMNS = (
     "cookie_expires_at", "cookie_issued_at", "cookie_last_seen_valid_at",
     "cookie_last_rotated_at", "cookie_last_rotate_keys",
+    "cookie_last_rotate_source",
     "cookie_next_keepalive_at", "cookie_health", "cookie_fail_streak",
     "cookie_warned_at", "cookie_lifetime_observed_days",
 )
@@ -685,6 +690,7 @@ def on_cookie_replaced(account_id: int, cookie_str: str) -> None:
         cookie_last_seen_valid_at="",
         cookie_last_rotated_at="",
         cookie_last_rotate_keys="",
+        cookie_last_rotate_source="",
         cookie_next_keepalive_at=_fmt_time(
             now + timedelta(hours=_keepalive_interval_hours())),
         cookie_health="unknown",

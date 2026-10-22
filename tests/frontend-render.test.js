@@ -195,8 +195,8 @@ function check(name, cond) {
   check('设置页有保存操作区', !!window.document.querySelector('.settings-save'));
 
   const pageHtml = window.document.documentElement.outerHTML;
-  check('样式缓存版本为 1.3.3', pageHtml.includes('/style.css?v=1.3.3'));
-  check('脚本缓存版本为 1.3.3', pageHtml.includes('/app.js?v=1.3.3'));
+  check('样式缓存版本为 1.3.4', pageHtml.includes('/style.css?v=1.3.4'));
+  check('脚本缓存版本为 1.3.4', pageHtml.includes('/app.js?v=1.3.4'));
 
   console.log('— 弹窗 —');
   window.document.querySelector('.nav-item[data-view="accounts"]').click();

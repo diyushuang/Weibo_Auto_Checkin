@@ -13,12 +13,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .. import auth, database, security
+from .. import auth, database, security, topics_service
 from ..security import safe_exc
 from ..weibo_client import (
     CheckinOptions,
     fetch_topic_posts,
-    get_followed_topics,
     normalize_cookie,
 )
 
@@ -258,50 +257,12 @@ def refresh_topics(data: RefreshIn, user=Depends(auth.require_admin)):
     if not cookie:
         raise HTTPException(400, "账号 Cookie 为空")
 
-    from ..weibo_client import new_account_session
-    session = new_account_session()
-
-    proxy = (acc.get("proxy") or "").strip() or None
-    channel = "socks" if proxy else "direct"
-
-    from ..weibo_client import CheckinOptions
-    opts = CheckinOptions.from_settings(database.get_setting)
-
-    try:
-        topics = get_followed_topics(
-            session, cookie, channel=channel, proxy=proxy,
-            force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
-        )
-    except Exception as exc:
-        _persist_account_cookie(acc, session, cookie)
-        raise HTTPException(502, f"获取超话列表失败：{exc}") from exc
-    _persist_account_cookie(acc, session, cookie)
-
-    for t in topics:
-        cid = t.get("id", "")
-        if cid:
-            t["url"] = f"https://weibo.com/page/{cid}"
-
-    database.set_topic_cache(data.account_id, topics)
-
-    # 合并进全量去重表；upsert 只覆盖非空字段，刷新不会冲掉已有名称/头像/推送勾选
-    for t in topics:
-        cid = t.get("id", "")
-        if not cid:
-            continue
-        new_name = (t.get("name") or "").strip()
-        if not new_name and not database.get_all_topic(cid):
-            continue
-        database.upsert_all_topic(
-            topic_id=cid,
-            name=new_name,
-            topic_url=f"https://weibo.com/page/{cid}",
-            avatar_url=t.get("avatar", ""),
-            description=t.get("description", ""),
-            member_count=t.get("member_count", 0),
-        )
-
-    return {"ok": True, "count": len(topics), "topics": topics}
+    from ..cookie_lifecycle import get_account_lock
+    with get_account_lock(acc["id"]):
+        result = topics_service.refresh_topics_for_account(acc)
+    if not result["ok"]:
+        raise HTTPException(502, f"获取超话列表失败：{result['error']}")
+    return {"ok": True, "count": result["count"], "topics": result["topics"]}
 
 
 @router.post("/refresh_all")
@@ -311,10 +272,10 @@ def refresh_all_topics(user=Depends(auth.require_admin)):
     if not accounts:
         return {"ok": True, "results": [], "message": "没有账号"}
 
+    from ..cookie_lifecycle import get_account_lock
     results = []
     for acc in accounts:
-        cookie = normalize_cookie(acc.get("cookie") or acc.get("cookie_raw") or "")
-        if not cookie:
+        if not normalize_cookie(acc.get("cookie") or acc.get("cookie_raw") or ""):
             results.append({
                 "account_id": acc["id"],
                 "account_name": acc.get("name", ""),
@@ -323,60 +284,17 @@ def refresh_all_topics(user=Depends(auth.require_admin)):
                 "count": 0,
             })
             continue
-
-        try:
-            from ..weibo_client import new_account_session
-            session = new_account_session()
-
-            proxy = (acc.get("proxy") or "").strip() or None
-            channel = "socks" if proxy else "direct"
-
-            from ..weibo_client import CheckinOptions
-            opts = CheckinOptions.from_settings(database.get_setting)
-
-            topics = get_followed_topics(
-                session, cookie, channel=channel, proxy=proxy,
-                force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
-            )
-            _persist_account_cookie(acc, session, cookie)
-
-            for t in topics:
-                cid = t.get("id", "")
-                if cid:
-                    t["url"] = f"https://weibo.com/page/{cid}"
-
-            database.set_topic_cache(acc["id"], topics)
-
-            for t in topics:
-                cid = t.get("id", "")
-                if not cid:
-                    continue
-                new_name = (t.get("name") or "").strip()
-                if not new_name and not database.get_all_topic(cid):
-                    continue
-                database.upsert_all_topic(
-                    topic_id=cid,
-                    name=new_name,
-                    topic_url=f"https://weibo.com/page/{cid}",
-                    avatar_url=t.get("avatar", ""),
-                    description=t.get("description", ""),
-                    member_count=t.get("member_count", 0),
-                )
-
-            results.append({
-                "account_id": acc["id"],
-                "account_name": acc.get("name", ""),
-                "ok": True,
-                "count": len(topics),
-            })
-        except Exception as exc:
-            results.append({
-                "account_id": acc["id"],
-                "account_name": acc.get("name", ""),
-                "ok": False,
-                "error": str(exc),
-                "count": 0,
-            })
+        with get_account_lock(acc["id"]):
+            result = topics_service.refresh_topics_for_account(acc)
+        entry = {
+            "account_id": acc["id"],
+            "account_name": acc.get("name", ""),
+            "ok": result["ok"],
+            "count": result["count"],
+        }
+        if not result["ok"]:
+            entry["error"] = result["error"]
+        results.append(entry)
 
     total = sum(r.get("count", 0) for r in results)
     errors = [r for r in results if not r.get("ok")]
@@ -436,7 +354,7 @@ def _posts_session() -> requests.Session:
 def _persist_account_cookie(acc: dict, session, cookie: dict) -> None:
     """回写这次请求换发到的 cookie；任何失败都不能影响帖子本身。"""
     try:
-        from ..scheduler import get_account_lock, persist_refreshed_cookie
+        from ..cookie_lifecycle import get_account_lock, persist_refreshed_cookie
         with get_account_lock(acc["id"]):
             persist_refreshed_cookie(acc["id"], session, cookie)
     except Exception as exc:

@@ -161,7 +161,9 @@ def update_settings(values: dict, user: dict = Depends(auth.require_admin)):
         "topics_daily_push", "topics_daily_push_cron", "topics_daily_push_mode",
         "auto_refresh_topics",
         # Cookie 保活与到期预警
-        "keepalive_enabled", "keepalive_interval_hours", "keepalive_gap_seconds",
+        "keepalive_enabled", "keepalive_interval_hours",
+        "keepalive_urgent_interval_hours", "keepalive_quiet_hours",
+        "keepalive_gap_seconds",
         "keepalive_max_per_tick", "cookie_session_ttl_days",
         "cookie_expiry_warn_days", "cookie_warn_cooldown_hours",
     }
@@ -171,7 +173,8 @@ def update_settings(values: dict, user: dict = Depends(auth.require_admin)):
     if set(updates) & {"schedule_enabled", "schedule_cron", "topics_daily_push",
                        "topics_daily_push_cron", "topics_daily_push_mode",
                        "auto_refresh_topics", "keepalive_enabled",
-                       "keepalive_interval_hours"}:
+                       "keepalive_interval_hours",
+                       "keepalive_urgent_interval_hours"}:
         scheduler.reload_schedule()
     return database.get_settings()
 

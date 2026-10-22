@@ -161,7 +161,7 @@ def test_topics_api_cache_and_refresh(client):
         {"name": "超话1", "id": "100808a", "scheme": "/checkin?a=1", "done": False},
         {"name": "超话2", "id": "100808b", "scheme": None, "done": True},
     ]
-    with patch("app.api.topics.get_followed_topics", return_value=fake_topics):
+    with patch("app.topics_service.get_followed_topics", return_value=fake_topics):
         r = client.post("/api/topics/refresh", json={"account_id": acc["id"]})
     assert r.status_code == 200
     body = r.json()

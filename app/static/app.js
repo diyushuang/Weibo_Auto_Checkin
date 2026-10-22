@@ -204,7 +204,8 @@ function cookieExpiryCell(a) {
     'ALF 名义到期：' + (view.alf_expires_at || '无'),
     '按续期推算失效：' + (view.observed_deadline || '暂无续期记录'),
     '上次续期：' + (a.cookie_last_rotated_at || '从未') +
-      (a.cookie_last_rotate_keys ? '（' + a.cookie_last_rotate_keys + '）' : ''),
+      (a.cookie_last_rotate_keys ? '（' + a.cookie_last_rotate_keys + '）' : '') +
+      (a.cookie_last_rotate_source ? ' @ ' + a.cookie_last_rotate_source : ''),
     '下次保活：' + (a.cookie_next_keepalive_at || '未排期'),
     view.reason || '',
   ].join('\n');
@@ -1017,6 +1018,8 @@ async function loadSettings() {
     // Cookie 保活
     setVal('s-keepalive_enabled', settingsCache.keepalive_enabled!=='0');
     $('#s-keepalive_interval_hours').value = settingsCache.keepalive_interval_hours||'12';
+    $('#s-keepalive_urgent_interval_hours').value = settingsCache.keepalive_urgent_interval_hours||'6';
+    $('#s-keepalive_quiet_hours').value = settingsCache.keepalive_quiet_hours||'0-6';
     $('#s-keepalive_gap_seconds').value = settingsCache.keepalive_gap_seconds||'30';
     $('#s-keepalive_max_per_tick').value = settingsCache.keepalive_max_per_tick||'20';
     $('#s-cookie_session_ttl_days').value = settingsCache.cookie_session_ttl_days||'7';
@@ -1064,6 +1067,8 @@ function collectSettings() {
     // Cookie 保活
     keepalive_enabled: chk('s-keepalive_enabled'),
     keepalive_interval_hours: val('s-keepalive_interval_hours','12'),
+    keepalive_urgent_interval_hours: val('s-keepalive_urgent_interval_hours','6'),
+    keepalive_quiet_hours: val('s-keepalive_quiet_hours','0-6').trim()||'0-6',
     keepalive_gap_seconds: val('s-keepalive_gap_seconds','30'),
     keepalive_max_per_tick: val('s-keepalive_max_per_tick','20'),
     cookie_session_ttl_days: val('s-cookie_session_ttl_days','7'),

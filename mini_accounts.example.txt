@@ -1,0 +1,18 @@
+# 极简客户端账号文件示例（复制为 mini_accounts.txt 后填写）
+# 每行一个账号，支持三种格式：
+#
+#   1. 纯 cookie：
+# SUB=xxx; SUBP=xxx; SCF=xxx; ALF=xxx
+#
+#   2. 名字|cookie：
+# 小号A|SUB=xxx; SUBP=xxx; SCF=xxx
+#
+#   3. 名字|socks5代理|cookie（该账号走指定代理）：
+# 小号B|socks5://127.0.0.1:1080|SUB=xxx; SCF=xxx
+#
+# 说明：
+# - 以 # 开头的行是注释
+# - 用 `python mini_client.py import` 导入进面板数据库
+# - 这里填的是"种子 cookie"；运行后换发到的新 cookie 会自动写回数据库，
+#   无需手动更新本文件；重复导入按 SUB/名称去重更新
+# - 若手动改了本文件里的 cookie，重新 import 即视为重新登录

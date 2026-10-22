@@ -894,6 +894,7 @@ def test_writeback_persists_newly_issued_login_key(tmp_path, monkeypatch):
     acc = local_db.get_account(acc_id)
     assert "SCF" in acc["cookie_last_rotate_keys"]
     assert acc["cookie_last_rotated_at"]
+    assert acc["cookie_last_rotate_source"] == "checkin"
     assert acc["cookie_health"] in ("ok", "unknown", "expiring", "expired")
     local_db._local.conn = None
 
@@ -949,7 +950,8 @@ def test_keepalive_rotates_cookie_and_reschedules(tmp_path, monkeypatch):
     session = _jar_session([("SUB", "rotated"), ("SUBP", "p1")])
 
     with patch.object(sched, "verify_cookie", return_value=(True, "st1")), \
-         patch.object(sched, "new_account_session", return_value=session):
+         patch.object(sched, "new_account_session", return_value=session), \
+         patch.object(sched, "get_followed_topics", return_value=[]):
         stats = sched.run_keepalive_once([acc_id], force=True)
 
     assert stats["checked"] == 1 and stats["rotated"] == 1
@@ -959,6 +961,137 @@ def test_keepalive_rotates_cookie_and_reschedules(tmp_path, monkeypatch):
     assert acc["cookie_health"] in ("ok", "expiring", "expired")
     assert acc["cookie_next_keepalive_at"]
     assert acc["cookie_fail_streak"] == 0
+    assert acc["cookie_last_rotate_source"].startswith("keepalive")
+    local_db._local.conn = None
+
+
+def test_keepalive_interval_tightens_and_jitters_near_expiry(tmp_path, monkeypatch):
+    """临近预计失效：间隔自动加密到 urgent 以内，且排期带随机抖动。"""
+    sched, local_db, acc_id = _keepalive_env(
+        tmp_path, monkeypatch, cookie="SUB=old; SCF=c; ALF=4102444800")  # 2100 年
+    local_db.set_cookie_state(acc_id, cookie_issued_at="2020-01-01 00:00:00")
+    acc = local_db.get_account(acc_id)
+
+    assert sched.cookie_expiry_view(acc)["state"] in ("expiring", "expired")
+    hours = sched.keepalive_interval_hours(acc)
+    assert 1.0 <= hours <= 6.0
+    jittered = sched._jitter_hours(hours)
+    assert 0.85 * hours <= jittered <= 1.2 * hours
+
+    scheduled = sched._next_keepalive_at(hours, urgent=True)
+    parsed = __import__("datetime").datetime.strptime(scheduled, "%Y-%m-%d %H:%M:%S")
+    delta_hours = (parsed - __import__("datetime").datetime.now()).total_seconds() / 3600
+    assert 0.8 * hours <= delta_hours <= 1.25 * hours + 0.01
+    local_db._local.conn = None
+
+
+def test_quiet_hours_shift_scheduled_keepalive(tmp_path, monkeypatch):
+    """深夜静默窗：命中的排期挪到清晨并加随机分钟；白天不动；off 关闭。"""
+    from datetime import datetime
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    assert sched._quiet_window() == (0, 6)
+
+    night = datetime(2026, 1, 1, 2, 30)
+    moved = sched._shift_out_of_quiet_hours(night)
+    assert datetime(2026, 1, 1, 6, 0) <= moved <= datetime(2026, 1, 1, 8, 0)
+
+    day = datetime(2026, 1, 1, 12, 0)
+    assert sched._shift_out_of_quiet_hours(day) == day
+
+    edge = datetime(2026, 1, 1, 6, 0)          # 窗口边界外，不动
+    assert sched._shift_out_of_quiet_hours(edge) == edge
+
+    local_db.set_settings({"keepalive_quiet_hours": "off"})
+    assert sched._quiet_window() is None
+    local_db._local.conn = None
+
+
+def test_urgent_keepalive_ignores_quiet_hours(tmp_path, monkeypatch):
+    """抢救期续命优先于作息伪装：urgent=True 不挪出静默窗。"""
+    from datetime import datetime
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    local_db.set_settings({"keepalive_quiet_hours": "0-23"})  # 极端全天静默
+    base = datetime(2026, 1, 1, 3, 0)
+    urgent_at = datetime.strptime(
+        sched._next_keepalive_at(6, base, urgent=True), "%Y-%m-%d %H:%M:%S")
+    # 6h × [0.85, 1.2] 抖动 → 最晚 10:12，绝不能等到 23 点窗口结束后
+    assert urgent_at <= datetime(2026, 1, 1, 10, 15)
+    local_db._local.conn = None
+
+
+def test_rotate_source_resets_on_new_cookie(tmp_path, monkeypatch):
+    """手工换新 cookie 后，上一份的换发来源必须清零。"""
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    session = _jar_session([("SUB", "rotated"), ("SUBP", "p1")])
+    with patch.object(sched, "verify_cookie", return_value=(True, "st1")), \
+         patch.object(sched, "new_account_session", return_value=session), \
+         patch.object(sched, "get_followed_topics", return_value=[]):
+        sched.run_keepalive_once([acc_id], force=True)
+    assert local_db.get_account(acc_id)["cookie_last_rotate_source"]
+
+    local_db.on_cookie_replaced(acc_id, "SUB=new; SCF=c")
+    acc = local_db.get_account(acc_id)
+    assert acc["cookie_last_rotate_source"] == ""
+    assert acc["cookie_last_rotated_at"] == ""
+    local_db._local.conn = None
+
+
+def test_keepalive_business_endpoint_forced_after_gap(tmp_path, monkeypatch):
+    """随机不中也没关系：隔满 N 轮必须强制掺一次真实业务端点。"""
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    sched._keepalive_business_gap[acc_id] = sched._KEEPALIVE_LIST_EVERY
+
+    with patch.object(sched, "verify_cookie", return_value=(True, "st")), \
+         patch.object(sched, "new_account_session", return_value=_jar_session([])), \
+         patch.object(sched, "get_followed_topics", return_value=[]) as spy, \
+         patch.object(sched.random, "random", return_value=0.99):
+        sched.run_keepalive_once([acc_id], force=True)
+
+    assert spy.called
+    assert sched._keepalive_business_gap[acc_id] == 0
+    local_db._local.conn = None
+
+
+def test_keepalive_business_endpoint_forced_when_expiring(tmp_path, monkeypatch):
+    """临期账号每轮都掺业务端点：SUB 换发多发生在业务接口。"""
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch,
+                                             cookie="SUB=old; SCF=c; ALF=4102444800")
+    local_db.set_cookie_state(acc_id, cookie_issued_at="2020-01-01 00:00:00")
+    sched._keepalive_business_gap[acc_id] = 0
+
+    with patch.object(sched, "verify_cookie", return_value=(True, "st")), \
+         patch.object(sched, "new_account_session", return_value=_jar_session([])), \
+         patch.object(sched, "get_followed_topics", return_value=[]) as spy, \
+         patch.object(sched.random, "random", return_value=0.99):
+        sched.run_keepalive_once([acc_id], force=True)
+
+    assert spy.called
+    local_db._local.conn = None
+
+
+def test_keepalive_business_endpoint_gap_advances_on_miss(tmp_path, monkeypatch):
+    """随机未中时记一笔轮次，保证最多 N 轮内一定补上业务请求。"""
+    from unittest.mock import patch
+
+    sched, local_db, acc_id = _keepalive_env(tmp_path, monkeypatch)
+    sched._keepalive_business_gap[acc_id] = 0
+
+    with patch.object(sched, "verify_cookie", return_value=(True, "st")), \
+         patch.object(sched, "new_account_session", return_value=_jar_session([])), \
+         patch.object(sched, "get_followed_topics", return_value=[]) as spy, \
+         patch.object(sched.random, "random", return_value=0.99):
+        sched.run_keepalive_once([acc_id], force=True)
+
+    assert spy.called is False
+    assert sched._keepalive_business_gap[acc_id] == 1
     local_db._local.conn = None
 
 
@@ -1113,7 +1246,8 @@ def test_keepalive_all_and_single_endpoints(client, monkeypatch):
     }).json()["id"]
     with patch.object(sched, "verify_cookie", return_value=(True, "st")), \
          patch.object(sched, "new_account_session",
-                      return_value=_jar_session([("SUB", "s2")])):
+                      return_value=_jar_session([("SUB", "s2")])), \
+         patch.object(sched, "get_followed_topics", return_value=[]):
         r = client.post(f"/api/accounts/{acc_id}/keepalive")
         assert r.status_code == 200
         assert r.json()["checked"] == 1
@@ -1149,6 +1283,8 @@ def test_settings_keepalive_keys_are_writable(client):
     """新设置 key 必须同时进白名单，否则"改了没生效"。"""
     r = client.post("/api/settings", json={
         "keepalive_enabled": "0", "keepalive_interval_hours": "6",
+        "keepalive_urgent_interval_hours": "4",
+        "keepalive_quiet_hours": "1-7",
         "keepalive_gap_seconds": "15", "keepalive_max_per_tick": "5",
         "cookie_session_ttl_days": "5", "cookie_expiry_warn_days": "1",
         "cookie_warn_cooldown_hours": "3", "not_a_real_key": "x",
@@ -1157,6 +1293,8 @@ def test_settings_keepalive_keys_are_writable(client):
     saved = r.json()
     assert saved["keepalive_enabled"] == "0"
     assert saved["keepalive_interval_hours"] == "6"
+    assert saved["keepalive_urgent_interval_hours"] == "4"
+    assert saved["keepalive_quiet_hours"] == "1-7"
     assert saved["cookie_session_ttl_days"] == "5"
     assert saved["cookie_warn_cooldown_hours"] == "3"
     assert "not_a_real_key" not in saved

@@ -15,7 +15,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import auth, database
+from .. import accounts_service, auth, database
 from .. import __version__
 from ..security import safe_exc, validate_weibo_url
 
@@ -583,25 +583,6 @@ def _fetch_weibo_username(session: requests.Session) -> str:
     return _fetch_weibo_profile(session)["name"]
 
 
-def _cookie_field(cookie: str, key: str) -> str:
-    """从 Cookie 字符串中取出指定键的值（不存在返回空串）。"""
-    m = re.search(r"(?:^|;)\s*" + re.escape(key) + r"=([^;]+)", cookie or "")
-    return m.group(1).strip() if m else ""
-
-
-def _find_same_weibo_account(uid: str, cookie: str) -> dict | None:
-    """查找同属一个微博号的已有账号：优先 weibo_uid，其次 SUB Cookie。"""
-    sub = _cookie_field(cookie, "SUB")
-    for acc in database.get_accounts():
-        if uid and acc.get("weibo_uid") and str(acc["weibo_uid"]) == str(uid):
-            return acc
-        if sub:
-            old_sub = _cookie_field(acc.get("cookie") or acc.get("cookie_raw") or "", "SUB")
-            if old_sub and old_sub == sub:
-                return acc
-    return None
-
-
 @router.post("/qr/finish")
 def finish_qr_login(data: QrLoginFinish, user: dict = Depends(auth.require_admin)):
     """把扫码登录取得的 Cookie 保存为签到账号；同一微博号已存在时直接覆盖。"""
@@ -629,37 +610,22 @@ def finish_qr_login(data: QrLoginFinish, user: dict = Depends(auth.require_admin
     if not name:
         name = profile.get("name", "")
 
-    account = {
-        "name": name or "扫码登录账号",
-        "cookie": cookie,
-        "cookie_raw": cookie,
-        "enabled": data.enabled,
-        "proxy_index": data.proxy_index,
-        "remark": data.remark,
-        "avatar_url": profile.get("avatar_url", ""),
-        "weibo_uid": profile.get("uid", ""),
-    }
-    existing = _find_same_weibo_account(profile.get("uid", ""), cookie)
-    if existing:
-        upd = {"cookie": cookie, "cookie_raw": cookie}
-        if account["weibo_uid"]:
-            upd["weibo_uid"] = account["weibo_uid"]
-        if account["avatar_url"]:
-            upd["avatar_url"] = account["avatar_url"]
-        if data.name.strip():
-            upd["name"] = data.name.strip()
-        database.update_account(existing["id"], upd)
-        _qr_sessions.pop(data.session_id, None)
-        merged = database.get_account(existing["id"]) or account
-        return {
-            "id": existing["id"],
-            "name": merged.get("name", account["name"]),
-            "ok": True,
-            "updated": True,
-        }
-    account_id = database.add_account(account)
+    account, action = accounts_service.upsert_account(
+        cookie,
+        name=name,
+        default_name="扫码登录账号",
+        enabled=data.enabled,
+        remark=data.remark,
+        avatar_url=profile.get("avatar_url", ""),
+        weibo_uid=str(profile.get("uid") or ""),
+    )
     _qr_sessions.pop(data.session_id, None)
-    return {"id": account_id, "name": account["name"], "ok": True, "updated": False}
+    return {
+        "id": account["id"],
+        "name": account.get("name", name),
+        "ok": True,
+        "updated": action == "updated",
+    }
 
 
 def _resolve_proxy(payload: dict, current: str = "") -> dict:
@@ -728,58 +694,40 @@ class AccountBatchImport(BaseModel):
     content: str
 
 
-def _parse_account_line(line: str, index: int) -> dict | None:
-    """解析单行账号数据，返回 account dict 或 None（跳过）。"""
-    raw = line.strip()
-    # 跳过空行和注释
-    if not raw or raw.startswith("#"):
-        return None
-    # 按最后一个 | 分组：前面全是 name，最后一个是 cookie
-    # 但如果 cookie 里本身含 |（key=value; key2=value2 格式），
-    # 就不好办了。实际场景中 cookie 通常是 ; 分隔的字符串，| 极少出现。
-    # 简单策略：先尝试 name|cookie 模式（name 非空），
-    # 若 cookie 含 | 且 name 部分为空则退化为纯 cookie。
-    parts = raw.split("|")
-    if len(parts) >= 2 and parts[0].strip():
-        name = parts[0].strip()
-        cookie = "|".join(parts[1:]).strip()
-        if cookie:
-            return {"name": name, "cookie_raw": cookie}
-    # 纯 cookie（无显式 name）
-    cookie_only = raw
-    return {
-        "name": f"微博账号{index}",
-        "cookie_raw": cookie_only,
-    }
-
-
 @router.post("/batch-import")
 def batch_import_accounts(data: AccountBatchImport, user: dict = Depends(auth.require_admin)):
     """批量导入多行账号（每行一个）。"""
-    lines = data.content.strip().split("\n")
-    results = {"added": 0, "skipped": 0, "errors": []}
+    results = {"added": 0, "updated": 0, "skipped": 0, "errors": []}
     counter = 1
-    for line in lines:
-        parsed = _parse_account_line(line, counter)
-        if not parsed:
-            continue
-        cookie = parsed.get("cookie_raw", "").strip()
-        if not cookie:
+    for line in data.content.splitlines():
+        try:
+            parsed = accounts_service.parse_account_line(line, counter)
+        except ValueError as exc:
             results["skipped"] += 1
-            results["errors"].append(f"第 {counter} 行：Cookie 为空，已跳过")
+            results["errors"].append(str(exc))
             counter += 1
             continue
+        if not parsed:
+            continue
         try:
-            acc_id = database.add_account({
-                "name": parsed.get("name", f"微博账号{results['added'] + 1}"),
-                "cookie_raw": cookie,
-                "enabled": True,
-                "remark": "批量导入",
-            })
-            results["added"] += 1
+            _acc, action = accounts_service.upsert_account(
+                parsed["cookie"],
+                name=parsed["name"],
+                proxy=parsed["proxy"],
+                remark="批量导入",
+                match_name=parsed["name"],
+            )
         except Exception as exc:
             results["skipped"] += 1
             results["errors"].append(f"第 {counter} 行：{exc}")
+            counter += 1
+            continue
+        if action == "created":
+            results["added"] += 1
+        elif action == "updated":
+            results["updated"] += 1
+        else:
+            results["skipped"] += 1
         counter += 1
     return results
 
@@ -823,8 +771,6 @@ class AccountImportData(BaseModel):
 @router.post("/import")
 def import_accounts(data: AccountImportData, user: dict = Depends(auth.require_admin)):
     """从 JSON 文件导入账号。"""
-    # 收集现有账号名，用于去重
-    existing_names = {a["name"] for a in database.get_accounts()}
     results = {"added": 0, "skipped": 0, "updated": 0, "errors": []}
     for idx, item in enumerate(data.accounts, start=1):
         name = (item.get("name") or "").strip()
@@ -835,35 +781,26 @@ def import_accounts(data: AccountImportData, user: dict = Depends(auth.require_a
             continue
         if not name:
             name = f"微博账号{datetime.now().strftime('%H%M%S%f')[:10]}_{idx}"
-        if name in existing_names and not data.overwrite:
-            results["skipped"] += 1
-            continue
         try:
-            if name in existing_names and data.overwrite:
-                # 查找并更新现有账号
-                for acc in database.get_accounts():
-                    if acc["name"] == name:
-                        database.update_account(acc["id"], {
-                            "cookie": cookie,
-                            "cookie_raw": cookie,
-                            "enabled": bool(item.get("enabled", True)),
-                            "remark": item.get("remark", "从文件导入"),
-                        })
-                        results["updated"] += 1
-                        break
-            else:
-                database.add_account({
-                    "name": name,
-                    "cookie": cookie,
-                    "cookie_raw": cookie,
-                    "enabled": bool(item.get("enabled", True)),
-                    "remark": item.get("remark", "从文件导入"),
-                })
-                existing_names.add(name)
-                results["added"] += 1
+            _acc, action = accounts_service.upsert_account(
+                cookie,
+                name=name,
+                enabled=bool(item.get("enabled", True)),
+                remark=item.get("remark") or "从文件导入",
+                weibo_uid=str(item.get("weibo_uid") or ""),
+                match_name=name if data.overwrite else None,
+                skip_if_name_exists=not data.overwrite,
+            )
         except Exception as exc:
             results["skipped"] += 1
             results["errors"].append(f"第 {idx} 项：{exc}")
+            continue
+        if action == "created":
+            results["added"] += 1
+        elif action == "updated":
+            results["updated"] += 1
+        else:
+            results["skipped"] += 1
     return results
 
 
@@ -871,22 +808,21 @@ def import_accounts(data: AccountImportData, user: dict = Depends(auth.require_a
 def create_account(data: AccountIn, user: dict = Depends(auth.require_admin)):
     payload = _resolve_proxy(data.model_dump())
     cookie = payload.get("cookie") or payload.get("cookie_raw") or ""
-    existing = _find_same_weibo_account("", cookie)
-    if existing:
-        # 同一微博号（SUB 相同）：直接覆盖已有记录，不再新增
-        upd = {"cookie": cookie, "cookie_raw": payload.get("cookie_raw") or cookie}
-        if (payload.get("name") or "").strip() and payload["name"].strip() != "未命名账号":
-            upd["name"] = payload["name"].strip()
-        if payload.get("proxy"):
-            upd["proxy"] = payload["proxy"]
-        if payload.get("remark"):
-            upd["remark"] = payload["remark"]
-        if payload.get("enabled") is not None:
-            upd["enabled"] = payload["enabled"]
-        database.update_account(existing["id"], upd)
-        return _public(database.get_account(existing["id"]))
-    acc_id = database.add_account(payload)
-    return _public(database.get_account(acc_id))
+    if not cookie:
+        # 占位账号（Cookie 稍后补填）保持既有行为：直接建空账号
+        acc_id = database.add_account(payload)
+        return _public(database.get_account(acc_id))
+    name = (payload.get("name") or "").strip()
+    if name == "未命名账号":
+        name = ""
+    acc, _action = accounts_service.upsert_account(
+        cookie,
+        name=name,
+        proxy=payload.get("proxy", ""),
+        remark=payload.get("remark", ""),
+        enabled=payload.get("enabled"),
+    )
+    return _public(acc)
 
 
 @router.get("/{account_id}")

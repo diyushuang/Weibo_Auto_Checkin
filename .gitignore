@@ -29,3 +29,13 @@ remote_deploy.py
 
 # 本地备份目录（勿提交）
 backups/
+
+# CLI 账号文件（含真实 Cookie，务必忽略；只提交 .example.txt）
+mini_accounts.txt
+mini_state.json
+mini_state.json.migrated
+
+# AI 编辑器/助手本地状态（勿提交）
+.mimosa/
+.workbuddy/
+.zcode/

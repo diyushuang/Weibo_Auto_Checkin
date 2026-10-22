@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 import uuid
@@ -14,12 +15,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from . import database, notifier
+from . import database, notifier, topics_service
 from .anti_ban import AntiBanPolicy
 from .security import safe_exc
+from .cookie_lifecycle import (  # noqa: F401 —— 兼容既有调用方与测试的再导出
+    _float_setting, _int_setting, _jitter_hours, _next_keepalive_at,
+    _quiet_window, _record_failure_streak, _shift_out_of_quiet_hours,
+    cookie_expiry_view, get_account_lock, keepalive_interval_hours,
+    persist_cookie_observation, persist_refreshed_cookie,
+    resolve_cookie_health,
+)
 from .weibo_client import (
     CheckinOptions, CookieExpiredError, NetworkError, RateLimitedError,
-    cookie_diff_gate, cookie_to_string, describe_cookie_lifespan,
+    cookie_diff_gate, cookie_to_string,
     fetch_topic_posts, new_account_session, harvest_cookie_rotation,
     normalize_cookie, reject_cookie_shrink, get_followed_topics,
     run_account_checkin, verify_cookie,
@@ -33,182 +41,6 @@ _keepalive_lock = threading.Lock()   # 独立于签到锁：保活绝不能挤�
 _state_lock = threading.Lock()   # 保护 _current_run/_last_run_summary 的替换与读取
 _current_run = None          # 当前运行状态（供前端轮询）
 _last_run_summary = None     # 最近一次任务汇总
-
-# 同一账号的"读 cookie → 发请求 → 回写"必须串行：签到线程按代理分组并行，
-# 保活 job 又独立触发，两边同时续期会互相覆盖出更旧的 SUB。
-_account_locks: dict[int, threading.Lock] = {}
-_account_locks_guard = threading.Lock()
-
-
-def get_account_lock(account_id: int) -> threading.Lock:
-    """按账号 id 取（或建）进程内互斥锁。"""
-    with _account_locks_guard:
-        lock = _account_locks.get(account_id)
-        if lock is None:
-            lock = threading.Lock()
-            _account_locks[account_id] = lock
-        return lock
-
-
-# cookie_health 取值优先级：越靠前越严重。观测结果与到期推算取更严重的那个。
-_HEALTH_PRIORITY = ("invalid", "expired", "expiring", "rate_limited",
-                    "network_error", "stale", "ok", "unknown")
-
-
-def resolve_cookie_health(observed: str, estimated: str) -> str:
-    """观测结果与到期推算取更严重的那个。
-
-    例外：微博刚确认登录有效时，不能因为"已超过经验寿命"就报已过期 —— 经验寿命
-    只是统计值，探活成功才是硬证据；这时报"即将失效"，既不隐瞒也不误杀。
-    """
-    if observed == "ok" and estimated == "expired":
-        return "expiring"
-
-    def rank(state: str) -> int:
-        return _HEALTH_PRIORITY.index(state) if state in _HEALTH_PRIORITY else 99
-    candidates = [state for state in (observed, estimated) if state]
-    if not candidates:
-        return "unknown"
-    return min(candidates, key=rank)
-
-
-def _int_setting(key: str, default: int) -> int:
-    try:
-        return int(database.get_setting(key, str(default)) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _float_setting(key: str, default: float) -> float:
-    try:
-        return float(database.get_setting(key, str(default)) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def cookie_expiry_view(acc: dict) -> dict:
-    """按当前设置把一行账号的 cookie 生命周期算成展示用 dict。"""
-    return describe_cookie_lifespan(
-        acc,
-        ttl_days=_int_setting("cookie_session_ttl_days", 7),
-        warn_days=_float_setting("cookie_expiry_warn_days", 2),
-    )
-
-
-def keepalive_interval_hours(acc: dict) -> float:
-    """自适应续期间隔：保证一个实测 session 寿命内至少成功换发 5 次，
-    连续失败则指数退避，别在代理抖动时猛撞接口。"""
-    base = _float_setting("keepalive_interval_hours", 12)
-    lifetime = int(acc.get("cookie_lifetime_observed_days") or 0)
-    interval = base
-    if lifetime > 0:
-        interval = min(base, max(lifetime * 24 / 5, 2.0))
-    streak = int(acc.get("cookie_fail_streak") or 0)
-    if streak > 0:
-        interval = min(24.0, interval * (2 ** streak))
-    return max(min(interval, 72.0), 1.0)
-
-
-def _cookie_state_meta(acc: dict, *, observed: str = "",
-                       rotated_keys: list[str] | None = None,
-                       now: datetime | None = None) -> dict:
-    """汇总一次认证请求的观测结果，得到要写进 cookie_* 列的元数据。"""
-    now = now or datetime.now()
-    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    view = cookie_expiry_view(acc)
-    health = resolve_cookie_health(observed, view["state"])
-    meta = {
-        "cookie_health": health,
-        "cookie_expires_at": view["alf_expires_at"],
-        "cookie_next_keepalive_at": (
-            now + timedelta(hours=keepalive_interval_hours(acc))).strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    if rotated_keys is not None:
-        meta["cookie_last_rotated_at"] = stamp
-        meta["cookie_last_rotate_keys"] = ",".join(rotated_keys)
-    if observed == "ok":
-        # 只有微博明确回了 login=True 才算"确认有效"；列表接口抖动或流程内部
-        # 异常都不能刷新这个时钟，否则真死了也报不出来。
-        meta["cookie_last_seen_valid_at"] = stamp
-        meta["cookie_fail_streak"] = 0
-    return meta
-
-
-def _record_failure_streak(account_id: int, observed: str) -> None:
-    """网络/风控类失败：退避重试，但绝不改 cookie，也不把账号判死（代理掉线≠登录过期）。"""
-    acc = database.get_account(account_id) or {}
-    streak = int(acc.get("cookie_fail_streak") or 0) + 1
-    interval = keepalive_interval_hours({**acc, "cookie_fail_streak": streak})
-    database.set_cookie_state(
-        account_id,
-        cookie_health=observed,
-        cookie_fail_streak=streak,
-        cookie_next_keepalive_at=(
-            datetime.now() + timedelta(hours=interval)).strftime("%Y-%m-%d %H:%M:%S"),
-    )
-
-
-# 签到结果里的 failure_type → cookie 观测健康度（未列出的按"登录态有效"处理）
-_OBSERVED_BY_FAILURE = {
-    "network": "network_error",
-    "rate_limited": "rate_limited",
-    "topics_list_error": "",
-    "internal_error": "",
-}
-
-
-def persist_cookie_observation(acc: dict, raw_cookie: str,
-                               cookie_dict: dict, result: dict) -> None:
-    """把一次认证请求观测到的 cookie 换发与生命周期状态写回库。
-
-    回写门用 cookie_diff_gate：只认同名 key 的变化会漏掉微博补发的登录凭据，
-    库里那份一旦缺了 SCF 就再也补不回来，session 便只能等死。
-    """
-    account_id = acc["id"]
-    name = acc.get("name", "未命名账号")
-    failure_type = result.get("failure_type")
-    changed = list(result.get("cookie_changed") or [])
-    added = list(result.get("cookie_added") or [])
-    refreshed = result.get("cookie") or {}
-
-    if failure_type == "cookie_invalid":
-        lifetime = database.mark_cookie_dead(account_id)
-        if lifetime:
-            log.info("  %s 实测 session 寿命约 %d 天，后续保活按此自适应加密", name, lifetime)
-        return
-
-    observed = _OBSERVED_BY_FAILURE.get(failure_type or "", "ok")
-    if observed in ("network_error", "rate_limited"):
-        _record_failure_streak(account_id, observed)
-        return
-    if observed == "":
-        # 列表接口抖动之类不能证明登录态好坏，只刷新到期视图，不动 valid 标记
-        database.set_cookie_state(account_id, **_cookie_state_meta(acc, observed=""))
-        return
-
-    if refreshed and cookie_diff_gate(changed, added):
-        new_cookie_str = cookie_to_string(refreshed)
-        reason = reject_cookie_shrink(cookie_dict, normalize_cookie(new_cookie_str))
-        if reason:
-            log.warning("  %s 放弃 cookie 回写：%s", name, reason)
-            database.set_cookie_state(account_id, **_cookie_state_meta(acc, observed="ok"))
-            return
-        rotated = list(dict.fromkeys(changed + added))
-        view = {**acc, "cookie": new_cookie_str, "cookie_raw": new_cookie_str,
-                "cookie_last_rotated_at": _now_str()}
-        wrote = database.merge_account_cookie(
-            account_id, new_cookie_str,
-            meta=_cookie_state_meta(view, observed="ok", rotated_keys=rotated),
-            expected_old=raw_cookie,
-        )
-        if wrote:
-            log.info("  🔄 %s 已续期 cookie（%s）", name, ",".join(rotated))
-        else:
-            log.info("  %s 的 cookie 已被其它流程更新，本次回写作废", name)
-        return
-
-    database.set_cookie_state(account_id, **_cookie_state_meta(acc, observed="ok"))
-
 
 def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -324,7 +156,8 @@ def run_checkin(trigger_type: str = "manual", account_ids: list[int] | None = No
                         "failure_type": "internal_error",
                     }
                 channel = "socks" if proxy_url else "direct"
-                persist_cookie_observation(acc, raw_cookie, cookie_dict, result)
+                persist_cookie_observation(acc, raw_cookie, cookie_dict, result,
+                                           source="checkin")
 
                 # 签到后自动刷新超话帖子缓存（如果启用）
                 if auto_refresh_enabled and result.get("status") in ("success", "partial"):
@@ -604,14 +437,16 @@ def _auto_refresh_topics_for_account(acc: dict, cookie_dict: dict,
 
     用账号专属 Session 而不是 get_thread_session()：后者复用前会清空 cookie jar，
     这批请求换发到的新 SUB 会被抹掉，白跑一轮还拿着旧凭证继续撞接口。
+    列表抓取走 topics_service 唯一实现；调用方（_process_one）已持有账号锁。
     """
     try:
         log.info("🔄 自动刷新超话帖子：%s", acc.get("name"))
+        result = topics_service.refresh_topics_for_account(acc)
+        if not result["ok"]:
+            log.warning("  自动刷新超话列表失败：%s", result["error"])
+            return
+        topics = result["topics"]
         session = new_account_session()
-        topics = get_followed_topics(
-            session, cookie_dict, channel=channel, proxy=proxy_url,
-            force=False, allow_fallback=True,
-        )
         count = 0
         for topic in topics:
             cid = topic.get("id")
@@ -631,32 +466,10 @@ def _auto_refresh_topics_for_account(acc: dict, cookie_dict: dict,
             except Exception as exc:
                 log.warning("  刷新超话 %s 失败：%s", cid, safe_exc(exc))
         log.info("  ✓ 已刷新 %d/%d 个超话的帖子", count, len(topics))
-        persist_refreshed_cookie(acc["id"], session, cookie_dict)
+        persist_refreshed_cookie(acc["id"], session, cookie_dict,
+                                 source="topics_refresh")
     except Exception as exc:
         log.warning("自动刷新超话帖子异常：%s", safe_exc(exc))
-
-
-def persist_refreshed_cookie(account_id: int, session, base_cookie: dict) -> bool:
-    """回收一次认证请求换发到的 Set-Cookie 并落库（调用方需持有该账号锁）。"""
-    merged, changed, added = harvest_cookie_rotation(session, base_cookie)
-    if not cookie_diff_gate(changed, added):
-        return False
-    new_cookie_str = cookie_to_string(merged)
-    reason = reject_cookie_shrink(base_cookie, normalize_cookie(new_cookie_str))
-    if reason:
-        log.warning("  放弃 cookie 回写：%s", reason)
-        return False
-    rotated = list(dict.fromkeys(changed + added))
-    acc = database.get_account(account_id) or {}
-    view = {**acc, "cookie": new_cookie_str, "cookie_raw": new_cookie_str,
-            "cookie_last_rotated_at": _now_str()}
-    wrote = database.merge_account_cookie(
-        account_id, new_cookie_str,
-        meta=_cookie_state_meta(view, observed="ok", rotated_keys=rotated),
-    )
-    if wrote:
-        log.info("  🔄 %s 已续期 cookie（%s）", acc.get("name", account_id), ",".join(rotated))
-    return wrote
 
 
 def _topics_daily_push_job() -> None:
@@ -725,9 +538,11 @@ def _purge_logs_job() -> None:
 
 # ========================= Cookie 保活 =========================
 
-# 每 N 轮保活掺一次超话列表请求：只戳 /api/config 的流量形状太机器化。
+# 业务端点混合：平时随机 1/N 概率掺一次超话列表请求，最多隔 N 轮强制补上；
+# 临近预计失效时每轮都掺。SUB 之类登录凭据的换发多发生在业务端点，
+# 只戳 /api/config 的流量形状不仅机器化，还常常根本续不动登录态。
 _KEEPALIVE_LIST_EVERY = 6
-_keepalive_ticks: dict[int, int] = {}
+_keepalive_business_gap: dict[int, int] = {}
 
 
 def _keepalive_one(acc: dict) -> dict:
@@ -745,14 +560,19 @@ def _keepalive_one(acc: dict) -> dict:
     opts = CheckinOptions.from_settings(database.get_setting)
     session = new_account_session()
 
-    ticks = _keepalive_ticks.get(acc["id"], 0) + 1
-    _keepalive_ticks[acc["id"]] = ticks
+    gap_ticks = _keepalive_business_gap.get(acc["id"], 0) + 1
+    touch_business = (
+        cookie_expiry_view(acc).get("state") in ("expiring", "expired")
+        or gap_ticks >= _KEEPALIVE_LIST_EVERY
+        or random.random() * _KEEPALIVE_LIST_EVERY < 1
+    )
+    _keepalive_business_gap[acc["id"]] = 0 if touch_business else gap_ticks
     try:
         logged_in, _st = verify_cookie(
             session, cookie_dict, channel=channel, proxy=proxy_url,
             force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
         )
-        if logged_in and ticks % _KEEPALIVE_LIST_EVERY == 0:
+        if logged_in and touch_business:
             # 掺一个真实业务端点；它同样会换发 cookie，由下面的统一回写收走
             get_followed_topics(
                 session, cookie_dict, channel=channel, proxy=proxy_url,
@@ -790,7 +610,9 @@ def _keepalive_one(acc: dict) -> dict:
     }
     fresh = {**acc, "cookie": cookie_to_string(merged),
              "cookie_raw": cookie_to_string(merged)}
-    persist_cookie_observation(fresh, raw_cookie, cookie_dict, result)
+    persist_cookie_observation(
+        fresh, raw_cookie, cookie_dict, result,
+        source=("keepalive/topics" if touch_business else "keepalive/config"))
     merged_str = cookie_to_string(merged)
     shrunk = reject_cookie_shrink(cookie_dict, normalize_cookie(merged_str))
     rotated = bool(cookie_diff_gate(changed, added)) and not shrunk
@@ -865,7 +687,8 @@ def run_keepalive_once(account_ids: list[int] | None = None, *,
     previous = {a["id"]: (a.get("cookie_health") or "unknown") for a in accounts}
     for index, acc in enumerate(accounts):
         if index and gap > 0:
-            time.sleep(gap)
+            # 账号间隔再加 0~30% 随机等待，多账号保活不呈等间隔节拍
+            time.sleep(gap * random.uniform(1.0, 1.3))
         lock = get_account_lock(acc["id"])
         # 账号正被签到流程占住时跳过，而不是把调度线程挂在这里
         if not lock.acquire(timeout=60):
