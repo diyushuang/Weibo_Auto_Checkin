@@ -20,7 +20,7 @@ class GifEncoderTest {
 
     private var pendingDelay = 0
 
-    private fun decode(gif: ByteArray): Pair<Pair<Int, Int>, List<Frame>> {
+    private fun decode(gif: ByteArray): Triple<Int, Int, List<Frame>> {
         assertEquals("GIF89a", String(gif.copyOfRange(0, 6), Charsets.US_ASCII))
         var p = 6
         fun u8(): Int = gif[p++].toInt() and 0xFF
@@ -80,7 +80,7 @@ class GifEncoderTest {
             }
         }
         assertEquals("结束符应为最后一个字节", gif.size, p)
-        return (width to height) to frames
+        return Triple(width, height, frames)
     }
 
     /** 标准 GIF LZW 解码（LSB-first 位序，与编码器互为镜像）。 */
@@ -160,7 +160,7 @@ class GifEncoderTest {
         )
         assertEquals(0x3B, gif[gif.size - 1].toInt() and 0xFF)
 
-        val ((w, h), frames) = decode(gif)
+        val (w, h, frames) = decode(gif)
         assertEquals(8, w)
         assertEquals(8, h)
         assertEquals("帧数应为 2", 2, frames.size)
@@ -184,7 +184,7 @@ class GifEncoderTest {
             return GifEncoder.GifFrame(w, h, px)
         }
         val gif = GifEncoder.encode(listOf(gradientFrame(0), gradientFrame(20)), delayCs = 8)
-        val ((dw, dh), frames) = decode(gif)
+        val (dw, dh, frames) = decode(gif)
         assertEquals(64, dw)
         assertEquals(64, dh)
         assertEquals(2, frames.size)
