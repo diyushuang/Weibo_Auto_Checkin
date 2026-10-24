@@ -31,7 +31,7 @@ class WeiboApiPureTest {
     @Test
     fun summarize_stripsHtmlAndEntities() {
         assertEquals("hello a&b", WeiboApi.summarize("hello&nbsp;<a>a&amp;b</a>"))
-        assertEquals("纯文本", WeiboApi.summarize("  纯\t文本  "))
+        assertEquals("纯 文本", WeiboApi.summarize("  纯\t文本  "))   // \t 折叠为单个空格
     }
 
     @Test

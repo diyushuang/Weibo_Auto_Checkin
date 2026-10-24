@@ -33,6 +33,13 @@ jobs:
           code=$?
           set -e
           if [ $code -ne 0 ]; then
+            # 测试失败：把 JUnit 报告的断言消息（含期望/实际值）转成注解
+            if ls android-app/app/build/test-results/testDebugUnitTest/*.xml >/dev/null 2>&1; then
+              grep -h -A 8 "<failure" android-app/app/build/test-results/testDebugUnitTest/*.xml \
+                | head -80 | grep -vE '^\s*$' | while IFS= read -r line; do
+                  printf '::error::TEST %s\n' "$(echo "$line" | sed 's/"/%22/g' | cut -c1-280)"
+                done
+            fi
             # 把编译/测试错误转成 check 注解：无需登录也能通过 API 读到错误明细
             grep -E "^e: |error: |FAILED|FAILURE|What went wrong|Caused by" -A 2 build.log \
               | grep -vE '^\s*$' | head -50 | sed 's/^/ /' | while IFS= read -r line; do
