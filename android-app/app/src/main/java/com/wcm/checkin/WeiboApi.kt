@@ -227,6 +227,7 @@ object WeiboApi {
         val pinned: Boolean,
         val isRetweet: Boolean,
         val picNum: Int,            // 不可信：Live 会重复计数，仅当粗筛用
+        val text: String = "",      // 去 HTML 的正文摘要（列表选择器展示用）
     )
 
     private val MONTHS = mapOf(
@@ -283,11 +284,36 @@ object WeiboApi {
                         pinned = mb.optInt("mblogtype", 0) == 1,
                         isRetweet = mb.optJSONObject("retweeted_status") != null,
                         picNum = mb.optInt("pic_num", 0),
+                        text = summarize(mb.optString("text", "")),
                     )
                 )
             }
             return total to posts
         }
+    }
+
+    /** 正文去 HTML 标签与常见实体，截断到 90 字（列表选择器展示口径）。 */
+    fun summarize(raw: String): String {
+        var text = raw.replace(Regex("<[^>]+>"), "")
+        text = text.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+        text = text.replace(Regex("\\s+"), " ").trim()
+        return if (text.length > 90) text.substring(0, 90) + "…" else text
+    }
+
+    /** 从用户输入解析单条微博标识（bid/mid）。支持链接与纯 ID 两种。 */
+    fun parseBidFromInput(input: String): String {
+        val t = input.trim()
+        if (t.isEmpty()) return ""
+        Regex("/detail/([A-Za-z0-9]+)").find(t)?.let { return it.groupValues[1] }
+        Regex("/status/([A-Za-z0-9]+)").find(t)?.let { return it.groupValues[1] }
+        Regex("weibo\\.com/\\d+/([A-Za-z0-9]+)").find(t)?.let { return it.groupValues[1] }
+        if (t.matches(Regex("^[A-Za-z0-9]{9}$"))) return t       // 9 位 base62 bid
+        if (t.matches(Regex("^\\d{9,}$"))) return t              // 数字 mid 直接可用
+        return ""
     }
 
     /** 微博详情（含完整 pic_ids 与帖级 live_photo，列表接口拿不到）。 */

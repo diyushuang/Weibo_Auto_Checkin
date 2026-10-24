@@ -29,7 +29,7 @@ object LivePhotoConverter {
         if (mov.isEmpty()) return null
         val tmp = File(context.cacheDir, "live_${System.currentTimeMillis()}.mov")
         val retriever = MediaMetadataRetriever()
-        val frames = ArrayList<Bitmap>()
+        val frames = ArrayList<GifEncoder.GifFrame>()
         try {
             tmp.writeBytes(mov)
             retriever.setDataSource(tmp.absolutePath)
@@ -59,7 +59,7 @@ object LivePhotoConverter {
                     }
                 }
                 if (frame != null) {
-                    frames.add(scaleDown(frame, maxEdge))
+                    frames.add(toGifFrame(scaleDown(frame, maxEdge)))
                 }
                 t += stepMs
             }
@@ -69,13 +69,20 @@ object LivePhotoConverter {
         } catch (e: Exception) {
             return null
         } finally {
-            frames.forEach { it.recycle() }
             try {
                 retriever.release()
             } catch (e: Exception) {
             }
             tmp.delete()
         }
+    }
+
+    /** Bitmap → ARGB 像素帧，转换后立即回收位图控内存。 */
+    private fun toGifFrame(b: Bitmap): GifEncoder.GifFrame {
+        val px = IntArray(b.width * b.height)
+        b.getPixels(px, 0, b.width, 0, 0, b.width, b.height)
+        b.recycle()
+        return GifEncoder.GifFrame(b.width, b.height, px)
     }
 
     /** 长边压到 maxEdge 以内（等比）；小图原样返回。原图立即回收省内存。 */

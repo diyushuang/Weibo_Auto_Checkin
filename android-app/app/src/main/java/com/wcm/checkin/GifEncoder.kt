@@ -11,13 +11,16 @@ import kotlin.math.sqrt
  * 口径对齐《抓取流程交接文档》的 ffmpeg 滤镜链：
  *   fps=12 + 长边 640（由调用方缩放）+ 256 色调色板（中值切分）+ Bayer 抖动。
  *
- * 性能：最近色查找用 15bit 量化缓存（32K 项），单帧 640x480 索引约 30 万次
- * 数组访问；调色板从全部帧抽样 ~3 万像素构建，单次几十毫秒级。
+ * 帧数据用 [GifFrame]（ARGB 像素数组）与 Android Bitmap 解耦，可直接跑 JVM 单元测试。
+ * 性能：最近色查找用 15bit 量化缓存（32K 项）；调色板从全部帧抽样 ~3 万像素构建。
  */
 object GifEncoder {
 
+    /** 一帧图像：ARGB int 数组（高 8 位 alpha 忽略，只取 RGB）。 */
+    class GifFrame(val width: Int, val height: Int, val pixels: IntArray)
+
     /** frames 需同尺寸；delayCs 为 1/100 秒单位的帧间隔。 */
-    fun encode(frames: List<android.graphics.Bitmap>, delayCs: Int): ByteArray {
+    fun encode(frames: List<GifFrame>, delayCs: Int): ByteArray {
         require(frames.isNotEmpty()) { "没有帧" }
         val w = frames[0].width
         val h = frames[0].height
@@ -79,15 +82,13 @@ object GifEncoder {
 
     // ---------------- 调色板：中值切分 ----------------
 
-    private fun buildPalette(frames: List<android.graphics.Bitmap>): IntArray {
+    private fun buildPalette(frames: List<GifFrame>): IntArray {
         val samples = ArrayList<Int>(1 shl 15)
         for (f in frames) {
-            val px = IntArray(f.width * f.height)
-            f.getPixels(px, 0, f.width, 0, 0, f.width, f.height)
-            val step = max(1, px.size / 6144)     // 每帧抽 ~6K 像素
+            val step = max(1, f.pixels.size / 6144)     // 每帧抽 ~6K 像素
             var i = 0
-            while (i < px.size) {
-                samples.add(px[i])
+            while (i < f.pixels.size) {
+                samples.add(f.pixels[i])
                 i += step
             }
         }
@@ -125,7 +126,7 @@ object GifEncoder {
         return palette
     }
 
-    /** channel: 0=R 1=G 2=B。返回该通道的极差。 */
+    /** channel: 0=R 1=G 2=B。返回极差最大的通道。 */
     private fun widestChannel(box: List<Int>): Int {
         var rmin = 255; var rmax = 0; var gmin = 255; var gmax = 0; var bmin = 255; var bmax = 0
         for (c in box) {
@@ -168,14 +169,13 @@ object GifEncoder {
     )
 
     private fun indexFrame(
-        frame: android.graphics.Bitmap,
+        frame: GifFrame,
         palette: IntArray,
         out: IntArray,
     ) {
         val w = frame.width
         val h = frame.height
-        val px = IntArray(w * h)
-        frame.getPixels(px, 0, w, 0, 0, w, h)
+        val px = frame.pixels
         // 15bit (5R5G5B) 量化缓存：同一量化色 + 同一抖动档 → 同一索引
         val cache = IntArray(32768) { -1 }
         for (i in px.indices) {

@@ -48,6 +48,13 @@
     <string name="crawl_need_target">请先添加抓取目标</string>
     <string name="crawl_need_dir">请先选择相册目录</string>
 
+    <!-- 单条抓取 -->
+    <string name="single_btn">抓取单条微博（链接 / 选博主）</string>
+    <string name="single_title">单条抓取</string>
+    <string name="single_input_hint">微博链接 / bid，或博主 UID</string>
+    <string name="single_input_note">粘贴微博链接直接抓取；填博主 UID 会列出其最近微博供选择。</string>
+    <string name="single_pick_title">选择要抓取的微博（最近 %1$d 条）</string>
+
     <!-- 设置页 -->
     <string name="settings_panel_title">面板同步</string>
     <string name="settings_panel_url_hint">面板地址（https://…）</string>

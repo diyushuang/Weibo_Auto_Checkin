@@ -8,7 +8,7 @@ import org.json.JSONObject
 import java.io.IOException
 
 /**
- * 原图抓取引擎（v0.2.0）。口径对齐《抓取流程交接文档》：
+ * 原图抓取引擎（v0.3.1）。口径对齐《抓取流程交接文档》：
  *
  * 1. 列表 /api/container/getIndex?containerid=107603<UID>&page=N（每页 10 条，card_type=9）；
  * 2. 详情 /statuses/show?id=<BID> 才有完整 pic_ids 与帖级 live_photo；
@@ -20,10 +20,9 @@ import java.io.IOException
  * 7. 节流：下载间 600-900ms、详情间 ≥620ms、翻页间 ≥700ms。
  *
  * 下载阶段对 CDN 完全匿名（不带 Cookie）；所有出站 URL 过微博域名白名单。
+ * v0.3.1：支持单条微博抓取（crawlSinglePost），幂等靠文件名，不占用增量进度。
  */
 object Crawler {
-
-    class CrawlStopped(message: String) : Exception(message)
 
     /** SAF 相册目录：DocumentsContract 单次查询缓存全部文件名，创建即写入。 */
     class TreeStore(private val resolver: ContentResolver, treeUri: Uri) {
@@ -74,13 +73,12 @@ object Crawler {
 
     /** pics 归一化：数组或数字键对象 → 列表。 */
     private fun normPics(o: Any?): List<JSONObject> {
-        val arr = when (o) {
+        return when (o) {
             is org.json.JSONArray ->
                 (0 until o.length()).mapNotNull { o.optJSONObject(it) }
             is JSONObject -> o.keys().asSequence().mapNotNull { o.optJSONObject(it) }.toList()
             else -> emptyList()
         }
-        return arr
     }
 
     /** 从 large.url 反推 pid（比 p.pid 稳：Live 条目两处 pid 不总一致）。 */
@@ -93,6 +91,170 @@ object Crawler {
         }
         return pic.optString("pid", "")
     }
+
+    /** 一条微博的全部图片资产（解析自详情接口）。 */
+    class PostAssets(
+        val picIds: List<String>,
+        val liveByIndex: Map<Int, String>,
+        val liveExtras: List<String>,
+    ) {
+        val totalFiles: Int get() = picIds.size + liveByIndex.size + liveExtras.size
+    }
+
+    /** 详情 → 图清单（pic_ids 完整保序）+ Live 配对（pics 前 9 条内）+ 独立 Live。 */
+    private fun assetsFromDetail(detail: JSONObject): PostAssets {
+        val picIds = ArrayList<String>()
+        val idsArr = detail.optJSONArray("pic_ids")
+        if (idsArr != null) {
+            for (i in 0 until idsArr.length()) picIds.add(idsArr.optString(i, ""))
+        }
+        val pics = normPics(detail.opt("pics"))
+        if (picIds.isEmpty()) pics.forEach { picIds.add(pidOf(it)) }
+
+        val liveByIndex = HashMap<Int, String>()
+        val usedLiveUrls = HashSet<String>()
+        for (pic in pics) {
+            val videoSrc = pic.optString("videoSrc", "")
+            if (pic.optString("type") == "livephoto" && videoSrc.isNotEmpty()) {
+                val idx = picIds.indexOf(pidOf(pic))
+                if (idx >= 0) {
+                    liveByIndex[idx] = videoSrc
+                    usedLiveUrls.add(videoSrc)
+                }
+            }
+        }
+        val liveExtras = ArrayList<String>()
+        val postLive = detail.optJSONArray("live_photo")
+        if (postLive != null) {
+            for (i in 0 until postLive.length()) {
+                val enc = postLive.optString(i, "")
+                if (enc.isNotEmpty() && !usedLiveUrls.contains(LIVE_WRAPPER + enc)) {
+                    liveExtras.add(LIVE_WRAPPER + enc)
+                }
+            }
+        }
+        return PostAssets(picIds, liveByIndex, liveExtras)
+    }
+
+    /**
+     * 按序下载一帖全部资产。already = 该帖已完成的文件序号（断点续跑跳过前 N 个）。
+     * 返回 (新落盘数, 完成序号)。
+     */
+    private suspend fun saveAssetSequence(
+        ctx: Context,
+        store: TreeStore,
+        prefix: String,
+        assets: PostAssets,
+        already: Int,
+        log: (String) -> Unit,
+    ): Pair<Int, Int> {
+        var seq = 0
+        var saved = 0
+        for (i in assets.picIds.indices) {
+            val stillName = String.format("%s_%02d.jpg", prefix, i + 1)
+            if (seq++ < already || store.hasFile(stillName)) {
+            } else {
+                val bytes = fetchBytes(WeiboApi.originalImageUrl(assets.picIds[i]))
+                if (bytes != null && store.save(ctx.contentResolver, stillName, "image/jpeg", bytes)) {
+                    saved++
+                } else {
+                    log("  ✗ $stillName 下载失败")
+                }
+                kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
+            }
+            assets.liveByIndex[i]?.let { wrapper ->
+                val liveBase = String.format("%s_%02d_live", prefix, i + 1)
+                if (seq++ < already) {
+                } else if (saveLive(ctx, store, liveBase, wrapper)) {
+                    saved++
+                } else {
+                    log("  ✗ ${liveBase}.gif/.mov 保存失败")
+                }
+            }
+        }
+        assets.liveExtras.forEachIndexed { n, wrapper ->
+            val liveBase = String.format("%s_live%02d", prefix, n + 1)
+            if (seq++ < already) {
+            } else if (saveLive(ctx, store, liveBase, wrapper)) {
+                saved++
+            } else {
+                log("  ✗ ${liveBase}.gif/.mov 保存失败")
+            }
+        }
+        return saved to seq
+    }
+
+    /**
+     * 保存一个 Live Photo：优先转 GIF（设置开启且转换成功），失败或关闭时保存原始 mov，
+     * 内容不丢。转换用 cacheDir 临时文件，相册目录不留 mov 残留。
+     */
+    private suspend fun saveLive(
+        ctx: Context,
+        store: TreeStore,
+        baseName: String,
+        wrapperUrl: String,
+    ): Boolean {
+        val mov = fetchBytes(wrapperUrl)
+        if (mov == null) {
+            kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
+            return false
+        }
+        if (AccountStore.crawlGif(ctx)) {
+            val gif = LivePhotoConverter.movBytesToGif(ctx, mov)
+            if (gif != null && store.save(ctx.contentResolver, "$baseName.gif", "image/gif", gif)) {
+                kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
+                return true
+            }
+        }
+        val ok = store.save(ctx.contentResolver, "$baseName.mov", "video/quicktime", mov)
+        kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
+        return ok
+    }
+
+    // ========================= 单条抓取（v0.3.1） =========================
+
+    /** 抓取一条微博的全部原图与 Live。幂等：同名文件跳过，不占用增量进度。 */
+    suspend fun crawlSinglePost(ctx: Context, bid: String, log: (String) -> Unit) {
+        val accounts = AccountStore.load(ctx)
+        if (accounts.isEmpty()) {
+            log("✗ 没有登录账号，先在首页添加账号")
+            return
+        }
+        val treeUriRaw = AccountStore.crawlTreeUri(ctx)
+        if (treeUriRaw.isEmpty()) {
+            log("✗ 请先选择相册目录")
+            return
+        }
+        val cookie = accounts.first().cookie
+        val store = TreeStore(ctx.contentResolver, Uri.parse(treeUriRaw))
+        store.loadExisting()
+
+        val detail = try {
+            WeiboApi.fetchPostDetail(cookie, bid)
+        } catch (e: Exception) {
+            log("✗ 详情获取失败：${e.message}")
+            return
+        }
+        val assets = assetsFromDetail(detail)
+        if (assets.picIds.isEmpty()) {
+            log("✗ 该微博没有图片（或为视频微博）")
+            return
+        }
+        val t = WeiboApi.parseWeiboTime(detail.optString("created_at", ""))
+        val date = t?.first ?: "unknown"
+        val hhmm = t?.second?.replace(":", "") ?: "000000"
+        val screenName = detail.optJSONObject("user")?.optString("screen_name", "") ?: ""
+        val prefix = "${date}_${hhmm}_${safeName(screenName.ifEmpty { "微博" })}"
+        val liveCount = assets.liveByIndex.size + assets.liveExtras.size
+        log("── 单条抓取 $prefix（${assets.picIds.size} 图 / $liveCount Live）──")
+        val (saved, _) = saveAssetSequence(ctx, store, prefix, assets, 0, log)
+        log(
+            if (saved > 0) "✓ 完成，新增 $saved 个文件（目录累计 ${store.count()}）"
+            else "✓ 完成（文件均已存在，无新增）"
+        )
+    }
+
+    // ========================= 全量增量抓取 =========================
 
     /**
      * 对全部抓取目标跑一轮增量。cookie 取第一个账号；无配置（目标/目录）时直接返回。
@@ -115,8 +277,7 @@ object Crawler {
             return
         }
         val cookie = accounts.first().cookie
-        val treeUri = Uri.parse(treeUriRaw)
-        val store = TreeStore(ctx.contentResolver, treeUri)
+        val store = TreeStore(ctx.contentResolver, Uri.parse(treeUriRaw))
         store.loadExisting()
         log("相册目录已有 ${store.count()} 个文件")
 
@@ -187,7 +348,6 @@ object Crawler {
                 kotlinx.coroutines.delay(620)
             }
             if (newInPage == 0 && posts.none { !it.pinned && !donePosts.containsKey(it.id) && !it.isRetweet && it.picNum > 0 }) {
-                // 整页都没有可做的新帖：再确认一页，仍空则收工
                 emptyPages++
                 if (emptyPages >= 2) {
                     log("  第 $page 页无新内容，抓取完成")
@@ -222,113 +382,19 @@ object Crawler {
         val hhmm = time?.second?.replace(":", "") ?: "000000"
         val prefix = "${date}_${hhmm}_$label"
 
-        // 图清单：详情 pic_ids 完整且保序；为空再退化到 pics
-        val picIds = ArrayList<String>()
-        val idsArr = detail.optJSONArray("pic_ids")
-        if (idsArr != null) {
-            for (i in 0 until idsArr.length()) picIds.add(idsArr.optString(i, ""))
-        }
-        val pics = normPics(detail.opt("pics"))
-        if (picIds.isEmpty()) pics.forEach { picIds.add(pidOf(it)) }
-        if (picIds.isEmpty()) {
+        val assets = assetsFromDetail(detail)
+        if (assets.picIds.isEmpty()) {
             donePosts[post.id] = 0   // 视频帖（pic_num 是封面计数）：标记完成避免反复请求
             return 0
         }
-
-        // Live 配对：pics 里 type==livephoto 的条目（≤9 条，超出部分无法配对 → 独立存放）
-        val liveByIndex = HashMap<Int, String>()
-        val usedLiveUrls = HashSet<String>()
-        for (pic in pics) {
-            val videoSrc = pic.optString("videoSrc", "")
-            if (pic.optString("type") == "livephoto" && videoSrc.isNotEmpty()) {
-                val idx = picIds.indexOf(pidOf(pic))
-                if (idx >= 0) {
-                    liveByIndex[idx] = videoSrc
-                    usedLiveUrls.add(videoSrc)
-                }
-            }
-        }
-        val liveExtras = ArrayList<String>()
-        val postLive = detail.optJSONArray("live_photo")
-        if (postLive != null) {
-            for (i in 0 until postLive.length()) {
-                val enc = postLive.optString(i, "")
-                if (enc.isNotEmpty() && !usedLiveUrls.contains(LIVE_WRAPPER + enc)) {
-                    liveExtras.add(LIVE_WRAPPER + enc)
-                }
-            }
-        }
-
-        val totalFiles = picIds.size + liveByIndex.size + liveExtras.size
         val already = donePosts[post.id] ?: 0
-        if (already >= totalFiles) return 0
+        if (already >= assets.totalFiles) return 0
 
-        var seq = 0
-        var saved = 0
-        // 逐图：序号与交接文档一致（两位序号，Live 与其静图同号加 _live）
-        for (i in picIds.indices) {
-            val stillName = String.format("%s_%02d.jpg", prefix, i + 1)
-            if (seq++ < already || store.hasFile(stillName)) {
-                // 已下载过（断点续跑 / 上一轮已存在）
-            } else {
-                val bytes = fetchBytes(WeiboApi.originalImageUrl(picIds[i]))
-                if (bytes != null && store.save(ctx.contentResolver, stillName, "image/jpeg", bytes)) {
-                    saved++
-                } else {
-                    log("  ✗ $stillName 下载失败")
-                }
-                kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
-            }
-            liveByIndex[i]?.let { wrapper ->
-                val liveBase = String.format("%s_%02d_live", prefix, i + 1)
-                if (seq++ < already) {
-                } else if (saveLive(ctx, store, liveBase, wrapper)) {
-                    saved++
-                } else {
-                    log("  ✗ ${liveBase}.mov/.gif 保存失败")
-                }
-            }
-        }
-        liveExtras.forEachIndexed { n, wrapper ->
-            val liveBase = String.format("%s_live%02d", prefix, n + 1)
-            if (seq++ < already) {
-            } else if (saveLive(ctx, store, liveBase, wrapper)) {
-                saved++
-            } else {
-                log("  ✗ ${liveBase}.mov/.gif 保存失败")
-            }
-        }
-
-        donePosts[post.id] = if (saved == 0 && already == 0 && picIds.isNotEmpty()) 0 else minOf(seq, totalFiles)
-        if (saved > 0) log("  ✓ $prefix…（+${saved}）")
+        val (saved, completed) = saveAssetSequence(ctx, store, prefix, assets, already, log)
+        donePosts[post.id] =
+            if (saved == 0 && already == 0 && assets.picIds.isNotEmpty()) 0 else completed
+        if (saved > 0) log("  ✓ $prefix…（+$saved）")
         return saved
-    }
-
-    /**
-     * 保存一个 Live Photo：优先转 GIF（设置开启且转换成功），失败或关闭时保存原始 mov，
-     * 内容不丢。转换用 cacheDir 临时文件，相册目录不留 mov 残留。
-     */
-    private suspend fun saveLive(
-        ctx: Context,
-        store: TreeStore,
-        baseName: String,
-        wrapperUrl: String,
-    ): Boolean {
-        val mov = fetchBytes(wrapperUrl)
-        if (mov == null) {
-            kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
-            return false
-        }
-        if (AccountStore.crawlGif(ctx)) {
-            val gif = LivePhotoConverter.movBytesToGif(ctx, mov)
-            if (gif != null && store.save(ctx.contentResolver, "$baseName.gif", "image/gif", gif)) {
-                kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
-                return true
-            }
-        }
-        val ok = store.save(ctx.contentResolver, "$baseName.mov", "video/quicktime", mov)
-        kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
-        return ok
     }
 
     /** 匿名下载（CDN 不需要登录态）。URL 必须过微博域名白名单；上限 64MB。 */

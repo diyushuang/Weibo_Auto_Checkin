@@ -25,16 +25,16 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
+      - name: Unit tests & Build debug APK
         run: |
           cd android-app
           set +e
-          sh gradlew assembleDebug --no-daemon > build.log 2>&1
+          sh gradlew testDebugUnitTest assembleDebug --no-daemon > build.log 2>&1
           code=$?
           set -e
           if [ $code -ne 0 ]; then
-            # 把编译错误转成 check 注解：无需登录也能通过 API 读到错误明细
-            grep -E "^e: |error: |FAILURE|What went wrong|Caused by" -A 2 build.log \
+            # 把编译/测试错误转成 check 注解：无需登录也能通过 API 读到错误明细
+            grep -E "^e: |error: |FAILED|FAILURE|What went wrong|Caused by" -A 2 build.log \
               | grep -vE '^\s*$' | head -50 | sed 's/^/ /' | while IFS= read -r line; do
                 printf '::error::%s\n' "$(echo "$line" | sed 's/"/%22/g')"
               done

@@ -122,6 +122,15 @@
                     android:layout_height="wrap_content"
                     android:text="@string/crawl_auto_after_checkin" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnSinglePost"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/single_btn"
+                    android:textSize="14sp" />
+
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"

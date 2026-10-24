@@ -54,6 +54,7 @@ class GalleryFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         view.findViewById<View>(R.id.btnPickDir).setOnClickListener { pickDir.launch(null) }
         view.findViewById<View>(R.id.btnAddTarget).setOnClickListener { addTarget() }
+        view.findViewById<View>(R.id.btnSinglePost).setOnClickListener { pickSinglePost() }
         view.findViewById<View>(R.id.btnCrawlStart).setOnClickListener { start() }
         view.findViewById<View>(R.id.btnCrawlStop).setOnClickListener { crawlJob?.cancel() }
 
@@ -193,6 +194,110 @@ class GalleryFragment : Fragment() {
                     view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = true
                     view?.findViewById<View>(R.id.btnAddTarget)?.isEnabled = true
                 }
+            }
+        }
+    }
+
+    // ---------- 单条抓取（v0.3.1） ----------
+
+    private fun pickSinglePost() {
+        if (busy) {
+            toast(getString(R.string.busy))
+            return
+        }
+        val ctx = requireContext()
+        val dialogView = layoutInflater.inflate(R.layout.dialog_single_post, null)
+        val et = dialogView.findViewById<TextInputEditText>(R.id.etSingleInput)
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle(getString(R.string.single_title))
+            .setView(dialogView)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val input = et.text?.toString() ?: ""
+                viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+                    val bid = WeiboApi.parseBidFromInput(input)
+                    if (bid.isNotEmpty()) {
+                        startSingle(bid)
+                        return@launch
+                    }
+                    // 不是微博链接：当博主 UID 处理，拉最近微博供选择
+                    val uid = WeiboApi.resolveUid(input)
+                    if (uid.isEmpty()) {
+                        log("✗ 无法识别输入：$input")
+                        return@launch
+                    }
+                    val cookie = AccountStore.load(ctx).firstOrNull()?.cookie
+                    if (cookie.isNullOrEmpty()) {
+                        log("✗ 没有登录账号，先在首页添加账号")
+                        return@launch
+                    }
+                    log("正在拉取博主 $uid 的最近微博…")
+                    val posts = ArrayList<WeiboApi.RawPost>()
+                    for (page in 1..2) {
+                        try {
+                            val (_, list) = WeiboApi.fetchUserPosts(cookie, uid, page)
+                            posts.addAll(list)
+                            if (list.isEmpty()) break
+                        } catch (e: Exception) {
+                            break
+                        }
+                    }
+                    if (posts.isEmpty()) {
+                        log("✗ 没有拉到微博（UID 是否正确？）")
+                        return@launch
+                    }
+                    withContext(Dispatchers.Main) { showPostPicker(posts) }
+                }
+            }
+            .show()
+    }
+
+    /** 简单的微博选择器：时间 + 图数 + 置顶/转发标记 + 正文摘要，点选即抓。 */
+    private fun showPostPicker(posts: List<WeiboApi.RawPost>) {
+        val items = posts.map { p ->
+            val t = WeiboApi.parseWeiboTime(p.createdAt)
+            val whenStr = if (t != null) {
+                "${t.first.substring(5)} ${t.second.substring(0, 5)}"
+            } else {
+                "未知时间"
+            }
+            val tags = buildString {
+                if (p.pinned) append(" · 置顶")
+                if (p.isRetweet) append(" · 转发")
+                else if (p.picNum > 0) append(" · ${p.picNum}图")
+                else append(" · 无图")
+            }
+            "$whenStr$tags\n${p.text.ifEmpty { "（无文字）" }}"
+        }.toTypedArray()
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.single_pick_title, posts.size))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setSingleChoiceItems(items, -1) { dialog, which ->
+                dialog.dismiss()
+                val bid = posts[which].bid
+                viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) { startSingle(bid) }
+            }
+            .show()
+    }
+
+    private suspend fun startSingle(bid: String) {
+        if (busy) return
+        busy = true
+        withContext(Dispatchers.Main) {
+            view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = false
+            view?.findViewById<View>(R.id.btnSinglePost)?.isEnabled = false
+        }
+        try {
+            Crawler.crawlSinglePost(requireContext(), bid, ::log)
+        } catch (e: CancellationException) {
+            log("⏹ 单条抓取被取消")
+        } catch (e: Exception) {
+            log("✗ 单条抓取异常：${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) {
+                busy = false
+                view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = true
+                view?.findViewById<View>(R.id.btnSinglePost)?.isEnabled = true
             }
         }
     }
