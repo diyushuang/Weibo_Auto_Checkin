@@ -182,6 +182,7 @@ object Crawler {
                     store.hasFile("$liveBase.gif") || store.hasFile("$liveBase.mov") ->
                         log("  ↷ 排除重复 $liveBase.gif/.mov（相册目录已存在同名文件）")
                     saveLive(ctx, store, liveBase, wrapper, log) -> saved++
+                    else -> {}   // 下载失败：saveLive 内部已写日志
                 }
             }
         }
@@ -192,6 +193,7 @@ object Crawler {
                 store.hasFile("$liveBase.gif") || store.hasFile("$liveBase.mov") ->
                     log("  ↷ 排除重复 $liveBase.gif/.mov（相册目录已存在同名文件）")
                 saveLive(ctx, store, liveBase, wrapper, log) -> saved++
+                else -> {}   // 下载失败：saveLive 内部已写日志
             }
         }
         return saved to seq
