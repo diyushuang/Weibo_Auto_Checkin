@@ -26,7 +26,7 @@ object Crawler {
     class CrawlStopped(message: String) : Exception(message)
 
     /** SAF 相册目录：DocumentsContract 单次查询缓存全部文件名，创建即写入。 */
-    class TreeStore(resolver: ContentResolver, treeUri: Uri) {
+    class TreeStore(private val resolver: ContentResolver, treeUri: Uri) {
         private val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
         private val rootUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
         private val childrenUri =
