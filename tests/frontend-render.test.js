@@ -47,6 +47,7 @@ const mockAccounts = [
     cookie_expiry: { alf_expires_at: '2027-08-14 07:00:00', observed_deadline: '2026-08-21 07:00:00', deadline: '2026-08-21 07:00:00', days_left: 7.0, state: 'ok', reason: '预计还能用 7 天' } },
   { id: 2, name: '小号B', enabled: 1, last_status: 'failed', last_checkin: null, last_message: 'Cookie 无效', cookie_length: 0, remark: '', proxy: '', proxy_id: null, proxy_label: '',
     cookie_health: 'invalid', cookie_last_rotated_at: '', cookie_last_rotate_keys: '', cookie_next_keepalive_at: '',
+    needs_relogin: true, relogin_reason: '登录态已失效，请扫码续期',
     cookie_expiry: { alf_expires_at: '', observed_deadline: '', deadline: '', days_left: null, state: 'unknown', reason: '缺少 ALF 与续期记录，无法估算到期' } },
 ];
 const mockTasks = [
@@ -119,11 +120,13 @@ function check(name, cond) {
 
   console.log('— 仪表盘 —');
   check('页面标题正确', window.document.title.includes('微博超话签到'));
-  check('7 张统计卡渲染', window.document.querySelectorAll('#statGrid .stat').length === 7);
+  check('8 张统计卡渲染', window.document.querySelectorAll('#statGrid .stat').length === 8);
   check('账号总数卡=2', window.document.querySelectorAll('#statGrid .stat .num')[0].textContent.includes('2'));
   check('累计超话签到卡=126', window.document.querySelectorAll('#statGrid .stat .num')[3].textContent.includes('126'));
   check('Cookie 风险卡=1', window.document.querySelectorAll('#statGrid .stat .num')[6].textContent.includes('1'));
   check('Cookie 风险卡标题', window.document.querySelectorAll('#statGrid .stat .lbl')[6].textContent.includes('Cookie'));
+  check('需扫码续期卡=1', window.document.querySelectorAll('#statGrid .stat .num')[7].textContent.includes('1'));
+  check('需扫码续期卡标题', window.document.querySelectorAll('#statGrid .stat .lbl')[7].textContent.includes('扫码'));
   check('7 天趋势柱渲染', window.document.querySelectorAll('#trendChart .trend-col').length === 7);
   check('每日一言展示', window.document.querySelector('#quoteBox').textContent.includes('日拱一卒'));
   check('每日一言出处', window.document.querySelector('#quoteFrom').textContent.includes('网络'));
@@ -140,6 +143,9 @@ function check(name, cond) {
   await new Promise(r => setTimeout(r, 200));
   check('账号表渲染 2 行', window.document.querySelectorAll('#accTable tbody tr').length === 2);
   check('账号名正确', window.document.querySelector('#accTable tbody tr').textContent.includes('小号A'));
+  check('续期横幅对失效账号可见', window.document.querySelector('#reloginBanner').hidden === false);
+  check('续期横幅含账号名', window.document.querySelector('#reloginText').textContent.includes('小号B'));
+  check('失效账号行有续期按钮', window.document.querySelector('#accTable button[data-action="relogin"]') !== null);
   const accTableText = window.document.querySelector('#accTable').textContent;
   check('账号行显示代理可读名称', accTableText.includes('香港节点'));
   check('表头含 Cookie 有效期列', window.document.querySelector('#accTable thead').textContent.includes('Cookie 有效期'));
@@ -195,8 +201,8 @@ function check(name, cond) {
   check('设置页有保存操作区', !!window.document.querySelector('.settings-save'));
 
   const pageHtml = window.document.documentElement.outerHTML;
-  check('样式缓存版本为 1.3.5', pageHtml.includes('/style.css?v=1.3.5'));
-  check('脚本缓存版本为 1.3.5', pageHtml.includes('/app.js?v=1.3.5'));
+  check('样式缓存版本为 1.3.7', pageHtml.includes('/style.css?v=1.3.7'));
+  check('脚本缓存版本为 1.3.7', pageHtml.includes('/app.js?v=1.3.7'));
 
   console.log('— 弹窗 —');
   window.document.querySelector('.nav-item[data-view="accounts"]').click();

@@ -127,7 +127,10 @@ def send_cookie_warning(changes: list[dict]) -> bool:
     if not lines:
         log.info("Cookie 预警处于冷却期，跳过推送")
         return False
-    lines.insert(0, "若账号已失效，请重新扫码或粘贴新 Cookie；未失效的会继续自动续期。")
+    lines.insert(0, "打开面板「账号管理」点「续期」扫码即可，无需删除重建账号；未失效的会继续自动续期。")
+    panel_url = str(database.get_setting("panel_url", "") or "").strip()
+    if panel_url:
+        lines.append("🔗 面板入口：" + panel_url)
     lines.insert(0, f"🍪 Cookie 状态变化 {len(alerted)} 个账号")
     return send_telegram("\n".join(lines), "🍪 微博 Cookie 预警")
 

@@ -1310,3 +1310,39 @@ def test_health_exposes_cookie_stats_without_failing(client):
     body = client.get("/api/health").json()
     assert body["ok"] is True
     assert body["cookie"].get("invalid") == 1
+
+
+def test_relogin_settings_keys_via_api(client):
+    """v1.3.6 扫码续期新键必须在设置白名单里，可写可读。"""
+    r = client.post("/api/settings", json={
+        "cookie_relogin_stale_hours": "24",
+        "panel_url": "https://panel.example.com",
+        "keepalive_passport_enabled": "1",
+        "keepalive_passport_urls": "https://weibo.com/",
+    })
+    assert r.status_code == 200
+    saved = r.json()
+    assert saved["cookie_relogin_stale_hours"] == "24"
+    assert saved["panel_url"] == "https://panel.example.com"
+    assert saved["keepalive_passport_enabled"] == "1"
+    assert saved["keepalive_passport_urls"] == "https://weibo.com/"
+
+
+def test_account_public_flags_needs_relogin(client):
+    """_public 需给出 needs_relogin / relogin_reason。"""
+    from datetime import datetime, timedelta
+    acc_id = client.post("/api/accounts", json={
+        "name": "临期号", "cookie": "SUB=abc; ALF=4102444800",
+    }).json()["id"]
+
+    # 刚录入的账号没有到期压力 → 不需要续期
+    row = next(r for r in client.get("/api/accounts").json() if r["id"] == acc_id)
+    assert row["needs_relogin"] is False
+    assert row["relogin_reason"] == ""
+
+    # 录入时间拨到 10 天前 → 预计失效已过 → 提示扫码续期
+    db.set_cookie_state(acc_id, cookie_issued_at=(
+        datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"))
+    row = next(r for r in client.get("/api/accounts").json() if r["id"] == acc_id)
+    assert row["needs_relogin"] is True
+    assert row["relogin_reason"]

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>微博超话签到管理面板</title>
-  <link rel="stylesheet" href="/style.css?v=1.3.5&rev=2" />
+  <link rel="stylesheet" href="/style.css?v=1.3.7&rev=1" />
   <script>!function(){try{const t=localStorage.getItem('wcm-theme')||'system';document.documentElement.dataset.theme=t}catch(e){}}()</script>
 </head>
 <body>
@@ -99,6 +99,10 @@
 
       <!-- 账号管理 -->
       <section class="view" id="view-accounts" hidden>
+        <div class="relogin-banner" id="reloginBanner" hidden>
+          <span class="relogin-text" id="reloginText"></span>
+          <button class="btn btn-danger btn-sm" id="btn-relogin-qr">📱 立即扫码续期</button>
+        </div>
         <div class="card">
           <div class="card-head">
             <h2>账号列表</h2>
@@ -422,6 +426,44 @@
                 <div class="settings-label"><label for="s-keepalive_max_per_tick">单次上限</label><small>一轮最多处理多少个账号，其余下轮继续</small></div>
                 <input id="s-keepalive_max_per_tick" class="input-modern" type="number" min="1" max="200" placeholder="20" />
               </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-cookie_relogin_stale_hours">扫码续期阈值</label><small>小时；临期且超过该时长仍无成功换发时，面板横幅与 TG 预警会建议扫码续期</small></div>
+                <input id="s-cookie_relogin_stale_hours" class="input-modern" type="number" min="1" max="168" placeholder="48" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-panel_url">面板访问地址</label><small>如 https://panel.example.com；填了之后 TG 的 Cookie 预警会附带面板链接，方便手机上直接打开扫码</small></div>
+                <input id="s-panel_url" class="input-modern" type="text" placeholder="https://…" />
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_passport_enabled">实验性 PC 端点换发</label><small>临期时额外请求 PC 端候选端点尝试换发新凭据；微博未承诺有效性，建议先用 CLI rotate-probe 实测</small></div>
+                <label class="switch"><input type="checkbox" id="s-keepalive_passport_enabled" /><span class="switch-slider"></span></label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-keepalive_passport_urls">候选端点列表</label><small>逗号分隔，仅允许微博域名；rotate-probe 实测有效后回填这里</small></div>
+                <input id="s-keepalive_passport_urls" class="input-modern" type="text" placeholder="https://weibo.com/,https://passport.weibo.com/" />
+              </div>
+            </div>
+          </div>
+
+          <!-- 手机保活（v1.3.7） -->
+          <div class="settings-section">
+            <div class="settings-section-head">
+              <span class="settings-section-ico">📲</span>
+              <h2>手机保活</h2>
+            </div>
+            <div class="settings-section-body">
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-mobile_sync_enabled">启用手机 App 同步</label><small>手机 App 持有登录态并自动签到，定期把新 Cookie 推送到面板（自动覆盖同微博号账号）；打开后需生成同步令牌</small></div>
+                <label class="switch"><input type="checkbox" id="s-mobile_sync_enabled" /><span class="switch-slider"></span></label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label"><label for="s-mobile_sync_token">同步令牌</label><small id="mobileLastInfo">App 端配置时粘贴此令牌；令牌仅能推送 Cookie，权限极小</small></div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <input id="s-mobile_sync_token" class="input-modern" type="text" readonly placeholder="尚未生成" style="flex:1;min-width:200px" />
+                  <button class="btn btn-ghost btn-sm" id="btn-mobile-token-copy" type="button">复制</button>
+                  <button class="btn btn-primary btn-sm" id="btn-mobile-token-gen" type="button">生成 / 重新生成</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -707,6 +749,7 @@
       </div>
       <div class="modal-body qr-body">
         <p class="qr-tip">使用 <b>微博 App</b> 扫描二维码并在手机上确认。确认后系统会自动获取微博昵称并导入账号。</p>
+        <p class="qr-tip qr-tip-sub">扫码成功后新 Cookie 会自动覆盖<b>同微博号</b>的原账号（代理、备注、启用状态保留），无需删除重建。</p>
         <div class="qr-stage">
           <div class="qr-box" id="qrBox">
             <img id="qrImage" alt="微博登录二维码" />
@@ -728,6 +771,6 @@
   </div>
 
   <div class="toast" id="toast"></div>
-  <script src="/app.js?v=1.3.5&rev=2"></script>
+  <script src="/app.js?v=1.3.7&rev=1"></script>
 </body>
 </html>

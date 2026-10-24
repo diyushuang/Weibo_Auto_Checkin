@@ -22,7 +22,7 @@ from .cookie_lifecycle import (  # noqa: F401 —— 兼容既有调用方与测
     _float_setting, _int_setting, _jitter_hours, _next_keepalive_at,
     _quiet_window, _record_failure_streak, _shift_out_of_quiet_hours,
     cookie_expiry_view, get_account_lock, keepalive_interval_hours,
-    persist_cookie_observation, persist_refreshed_cookie,
+    needs_relogin_reason, persist_cookie_observation, persist_refreshed_cookie,
     resolve_cookie_health,
 )
 from .weibo_client import (
@@ -30,7 +30,7 @@ from .weibo_client import (
     cookie_diff_gate, cookie_to_string,
     fetch_topic_posts, new_account_session, harvest_cookie_rotation,
     normalize_cookie, reject_cookie_shrink, get_followed_topics,
-    run_account_checkin, verify_cookie,
+    run_account_checkin, touch_passport_endpoints, verify_cookie,
 )
 
 log = logging.getLogger("weibo.scheduler")
@@ -567,6 +567,16 @@ def _keepalive_one(acc: dict) -> dict:
         or random.random() * _KEEPALIVE_LIST_EVERY < 1
     )
     _keepalive_business_gap[acc["id"]] = 0 if touch_business else gap_ticks
+    # 实验性 PC 端点换发：仅临期且开关打开时追加，普通轮次不加重流量
+    passport_urls = []
+    if (database.get_setting("keepalive_passport_enabled", "0") == "1"
+            and cookie_expiry_view(acc).get("state") in ("expiring", "expired")):
+        passport_urls = [
+            u.strip() for u in (database.get_setting(
+                "keepalive_passport_urls",
+                "https://weibo.com/,https://passport.weibo.com/") or "").split(",")
+            if u.strip()
+        ]
     try:
         logged_in, _st = verify_cookie(
             session, cookie_dict, channel=channel, proxy=proxy_url,
@@ -577,6 +587,12 @@ def _keepalive_one(acc: dict) -> dict:
             get_followed_topics(
                 session, cookie_dict, channel=channel, proxy=proxy_url,
                 force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
+            )
+        if logged_in and passport_urls:
+            touch_passport_endpoints(
+                session, cookie_dict, passport_urls, channel=channel,
+                proxy=proxy_url, force=opts.proxy_force,
+                allow_fallback=opts.proxy_fallback,
             )
     except RateLimitedError as exc:
         _record_failure_streak(acc["id"], "rate_limited")
@@ -610,9 +626,14 @@ def _keepalive_one(acc: dict) -> dict:
     }
     fresh = {**acc, "cookie": cookie_to_string(merged),
              "cookie_raw": cookie_to_string(merged)}
-    persist_cookie_observation(
-        fresh, raw_cookie, cookie_dict, result,
-        source=("keepalive/topics" if touch_business else "keepalive/config"))
+    # passport 端点是临期轮里最后一次触碰，harvest 到的换发大概率来自它
+    if passport_urls:
+        source = "keepalive/passport"
+    elif touch_business:
+        source = "keepalive/topics"
+    else:
+        source = "keepalive/config"
+    persist_cookie_observation(fresh, raw_cookie, cookie_dict, result, source=source)
     merged_str = cookie_to_string(merged)
     shrunk = reject_cookie_shrink(cookie_dict, normalize_cookie(merged_str))
     rotated = bool(cookie_diff_gate(changed, added)) and not shrunk

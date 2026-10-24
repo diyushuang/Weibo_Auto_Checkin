@@ -17,6 +17,7 @@
     python mini_client.py import                  # 导入 mini_accounts.txt
     python mini_client.py topics list             # 查看超话缓存
     python mini_client.py topics refresh          # 抓取超话列表并更新缓存
+    python mini_client.py rotate-probe            # 实验性：探测 PC 端点能否换发 Cookie
     python mini_client.py checkin --json          # 机器可读输出
 
 账号文件（mini_accounts.txt，# 注释，每行一个账号）：
@@ -37,6 +38,8 @@ from pathlib import Path
 
 from app import accounts_service, cookie_lifecycle, database, topics_service
 from app import scheduler as sched
+from app import weibo_client as wb
+from app.security import safe_exc, validate_weibo_url
 
 DEFAULT_DB = "data/weibo_checkin.db"
 DEFAULT_IMPORT = "mini_accounts.txt"
@@ -249,6 +252,110 @@ def cmd_topics(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+# ========================= 命令：rotate-probe（v1.3.6 实验性） =========================
+
+def _probe_candidate_urls(args: argparse.Namespace) -> list[str]:
+    if getattr(args, "urls", None):
+        return [u.strip() for u in str(args.urls).split(",") if u.strip()]
+    return [u.strip() for u in (database.get_setting(
+        "keepalive_passport_urls",
+        "https://weibo.com/,https://passport.weibo.com/") or "").split(",")
+        if u.strip()]
+
+
+def cmd_rotate_probe(args: argparse.Namespace) -> int:
+    """实验性：逐个 PC 端点探测微博是否静默换发新凭据。
+
+    用途：验证 keepalive_passport_enabled 实验功能对当前账号是否有效。
+    每个端点用独立 session 请求一次，harvest 出 Set-Cookie 变化并回写
+    数据库（CAS 保护，与面板/保活并发安全）；换发成功的端点会在结尾
+    汇总成 keepalive_passport_urls 的配置建议。
+    """
+    urls = _probe_candidate_urls(args)
+    if not urls:
+        print("没有可探测的端点。用 --urls \"https://weibo.com/,…\" 或先设置 keepalive_passport_urls。")
+        return 2
+    if getattr(args, "all", False):
+        accounts = database.get_enabled_accounts()
+    else:
+        ids = _resolve_account_ids(args)
+        if ids:
+            accounts = [database.get_account(i) for i in ids if database.get_account(i)]
+        else:
+            # 默认只探测临期账号：健康账号保活本身就续得上，探测是浪费请求
+            accounts = [a for a in database.get_enabled_accounts()
+                        if cookie_lifecycle.cookie_expiry_view(a).get("state")
+                        in ("expiring", "expired")]
+    if not accounts:
+        print("没有需要探测的账号（健康账号保活即可续期；可用 --account / --all 指定）。")
+        return 0
+
+    opts = wb.CheckinOptions.from_settings(database.get_setting)
+    dead = 0
+    for acc in accounts:
+        name = acc.get("name", acc["id"])
+        raw_cookie = acc.get("cookie") or acc.get("cookie_raw") or ""
+        cookie_dict = wb.normalize_cookie(raw_cookie)
+        print(f"== rotate-probe：{name} ==")
+        if not cookie_dict:
+            print("  Cookie 为空，无法探测（请重新扫码导入）")
+            dead += 1
+            continue
+        channel = "socks" if acc.get("proxy") else "direct"
+        proxy_url = acc.get("proxy") or None
+        try:
+            session = wb.new_account_session()
+            logged_in, _st = wb.verify_cookie(
+                session, cookie_dict, channel=channel, proxy=proxy_url,
+                force=opts.proxy_force, allow_fallback=opts.proxy_fallback)
+        except Exception as exc:
+            print(f"  探活请求失败：{safe_exc(exc)}（代理/网络抖动，稍后再试）")
+            continue
+        if not logged_in:
+            print("  登录态已失效：旧凭据换不出新 Cookie，请扫码续期")
+            dead += 1
+            continue
+        winners = []
+        for i, url in enumerate(urls, 1):
+            try:
+                validate_weibo_url(url)
+            except Exception as exc:
+                print(f"  [{i}/{len(urls)}] {url}\n      跳过：非法端点（{safe_exc(exc)}）")
+                continue
+            probe_session = wb.new_account_session()
+            try:
+                wb.request_via_proxy(
+                    probe_session, "GET", url, channel=channel, proxy=proxy_url,
+                    force=opts.proxy_force, allow_fallback=opts.proxy_fallback,
+                    timeout=15, cookies=cookie_dict,
+                    headers={"Referer": wb.BASE_PC + "/"},
+                )
+            except Exception as exc:
+                print(f"  [{i}/{len(urls)}] {url}\n      请求失败：{safe_exc(exc)}")
+                continue
+            merged, changed, added = wb.harvest_cookie_rotation(probe_session, cookie_dict)
+            if not (changed or added):
+                print(f"  [{i}/{len(urls)}] {url}\n      无 Set-Cookie 变化")
+                continue
+            keys = ", ".join(dict.fromkeys(changed + added))
+            print(f"  [{i}/{len(urls)}] {url}\n      换发：{keys}")
+            with cookie_lifecycle.get_account_lock(acc["id"]):
+                wrote = cookie_lifecycle.persist_refreshed_cookie(
+                    acc["id"], probe_session, cookie_dict, source="rotate-probe")
+            if wrote:
+                print("      ✅ 新凭据已回写数据库")
+                winners.append(url)
+                fresh = database.get_account(acc["id"])
+                if fresh:
+                    cookie_dict = wb.normalize_cookie(
+                        fresh.get("cookie") or fresh.get("cookie_raw") or "")
+        if winners:
+            print(f"  建议：把 {'、'.join(winners)} 保留在设置 keepalive_passport_urls，其余可删")
+        else:
+            print("  所有端点均未换发新凭据：PC 端点对该账号无效，扫码续期仍是唯一手段")
+    return 1 if dead else 0
+
+
 # ========================= 命令行入口 =========================
 
 def build_parser() -> argparse.ArgumentParser:
@@ -286,6 +393,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("topics", parents=[common], help="查看/刷新关注超话缓存")
     p.add_argument("topics_cmd", choices=["list", "refresh"])
     p.set_defaults(func=cmd_topics)
+
+    p = sub.add_parser("rotate-probe", parents=[common],
+                       help="实验性：探测 PC 端点能否静默换发 Cookie")
+    p.add_argument("--all", action="store_true",
+                   help="探测全部启用账号（默认只探测临期账号）")
+    p.add_argument("--urls", metavar="URL[,URL…]",
+                   help="逗号分隔的候选端点，覆盖设置 keepalive_passport_urls")
+    p.set_defaults(func=cmd_rotate_probe)
 
     return parser
 

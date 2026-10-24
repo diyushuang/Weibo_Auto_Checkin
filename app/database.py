@@ -308,6 +308,17 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
         "cookie_session_ttl_days": "7",      # 服务端 session 经验寿命（微博约 7 天）
         "cookie_expiry_warn_days": "2",      # 距预计失效几天前预警
         "cookie_warn_cooldown_hours": "12",  # 同一账号预警最小间隔
+        # ---- v1.3.6 扫码续期闭环 ----
+        "cookie_relogin_stale_hours": "48",  # 临期且 N 小时无成功换发 → 建议扫码续期
+        "panel_url": "",                     # TG 预警附带的面板访问地址（空=不加链接）
+        # ---- v1.3.6 实验性 PC 端点静默换发 ----
+        "keepalive_passport_enabled": "0",   # 临期时追加请求 PC 端点尝试换发（实验性）
+        "keepalive_passport_urls": "https://weibo.com/,https://passport.weibo.com/",
+        # ---- v1.3.7 手机 App 同步 ----
+        "mobile_sync_enabled": "0",          # 手机保活总开关（令牌鉴权的同步端点）
+        "mobile_sync_token": "",             # 同步令牌（仅 regenerate 接口可写）
+        "mobile_sync_last_at": "",           # 最近一次手机同步时间
+        "mobile_sync_last_result": "",       # 最近一次手机同步结果
     }
     for key, value in defaults.items():
         conn.execute(

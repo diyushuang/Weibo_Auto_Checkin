@@ -678,11 +678,16 @@ def _public(acc: dict) -> dict:
     acc["cookie_length"] = len(cookie) if cookie else 0
     # Cookie 生命周期是可展示元数据，不是凭据
     try:
-        from ..scheduler import cookie_expiry_view
+        from ..scheduler import cookie_expiry_view, needs_relogin_reason
         acc["cookie_expiry"] = cookie_expiry_view(acc)
+        reason = needs_relogin_reason(acc)
+        acc["needs_relogin"] = bool(reason)
+        acc["relogin_reason"] = reason
     except Exception as exc:  # 展示层不能因为时间解析问题把整个账号接口打挂
         log.warning("cookie 到期视图计算失败：%s", safe_exc(exc))
         acc["cookie_expiry"] = {}
+        acc["needs_relogin"] = False
+        acc["relogin_reason"] = ""
     raw_proxy = acc.get("proxy", "") or ""
     # 代理只对外给“打码链接 + 可读名称 + 引用 id”，不给明文密码。
     acc["proxy"] = database.mask_proxy_url(raw_proxy)

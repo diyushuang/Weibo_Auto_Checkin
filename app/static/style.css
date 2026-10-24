@@ -492,6 +492,17 @@ select.input-modern { cursor: pointer; }
   background: var(--surface-2);
 }
 .batch-bar:not([hidden]) { animation: softPop .2s ease both; }
+/* v1.3.6 Cookie 临期扫码续期横幅 */
+.relogin-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 0 0 var(--sp-3); padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-radius: 10px;
+  background: var(--warn-soft);
+}
+.relogin-banner .relogin-text { flex: 1; min-width: 220px; font-size: var(--fs-sm); }
+.relogin-banner:not([hidden]) { animation: softPop .2s ease both; }
+.qr-tip-sub { margin-top: 4px; font-size: var(--fs-xs); color: var(--muted); }
 /* 账号编辑弹窗：超话勾选区 */
 .topic-select-section { margin-top: 10px; }
 .topic-checkboxes {

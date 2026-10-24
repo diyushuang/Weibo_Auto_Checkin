@@ -6,6 +6,8 @@ __pycache__/
 
 # 运行时数据（含 Cookie，务必忽略）
 data/
+avatars/
+img_cache/
 *.db
 *.db-wal
 *.db-shm
@@ -35,7 +37,7 @@ mini_accounts.txt
 mini_state.json
 mini_state.json.migrated
 
-# AI 编辑器/助手本地状态（勿提交）
+# AI 编辑器/助手本地状态（安全钩子自动生成，勿提交）
 .mimosa/
 .workbuddy/
 .zcode/

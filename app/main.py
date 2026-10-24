@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from . import auth, database, scheduler
 from .api import accounts as accounts_api
 from .api import auth as auth_api
+from .api import mobile as mobile_api
 from .api import proxies as proxies_api
 from .api import tasks as tasks_api
 from .api import terminal as terminal_api
@@ -33,6 +34,8 @@ DATA_DIR = database.DB_PATH.parent
 PUBLIC_API_PATHS = frozenset({
     "/api/auth/login", "/api/auth/me", "/api/health",
     "/api/auth/init", "/api/auth/needs-init",
+    # 手机 App 同步：无浏览器会话，靠路由内的 X-Panel-Token 令牌鉴权 + 限流
+    "/api/mobile/sync",
 })
 PUBLIC_STATIC = frozenset({"/login.html", "/style.css", "/favicon.ico"})
 
@@ -50,7 +53,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="微博超话签到管理面板",
     description="微博超话批量签到 · 自动调度 · TG 通知 · 防封策略",
-    version="1.3.5",
+    version="1.3.7",
     lifespan=lifespan,
 )
 
@@ -60,6 +63,7 @@ app.include_router(auth_api.router)
 app.include_router(proxies_api.router)
 app.include_router(topics_api.router)
 app.include_router(terminal_api.router)
+app.include_router(mobile_api.router)
 
 
 @app.get("/api/health")

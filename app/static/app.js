@@ -163,6 +163,7 @@ function renderStats(stats, accounts) {
   const active = accounts.filter(a=>a.enabled);
   const okAcc = accounts.filter(a=>a.last_status==='success').length;
   const riskyAcc = active.filter(a=>['invalid','expired','expiring','stale','rate_limited'].includes(a.cookie_health)).length;
+  const reloginAcc = accounts.filter(a=>a.needs_relogin).length;
   $('#statGrid').innerHTML = [
     card('账号总数', accounts.length, 'acc', '个'),
     card('启用中', active.length, '', '个'),
@@ -171,6 +172,7 @@ function renderStats(stats, accounts) {
     card('成功率', stats.success_rate || 0, '', '%'),
     card('今日记录', stats.today || 0, '', '条'),
     card('Cookie 风险', riskyAcc, riskyAcc ? 'red' : 'green', '个'),
+    card('需扫码续期', reloginAcc, reloginAcc ? 'amber' : 'green', '个'),
   ].join('');
   var gridEl = document.getElementById('statGrid');
   var stats2 = gridEl.querySelectorAll('.stat');
@@ -223,6 +225,17 @@ function renderRecentTasks(tasks) {
       <td>${t.finished_at||'—'}</td>
     </tr>`).join('') : '<tr><td colspan="5" style="color:var(--muted)">暂无任务记录</td></tr>';
 }
+function updateReloginBanner(accounts) {
+  const banner = $('#reloginBanner');
+  if (!banner) return;
+  const need = (accounts || []).filter(a=>a.needs_relogin);
+  banner.hidden = need.length === 0;
+  if (!need.length) return;
+  const names = need.slice(0, 5).map(a=>a.name || ('账号' + a.id)).join('、');
+  const more = need.length > 5 ? ` 等 ${need.length} 个` : '';
+  $('#reloginText').textContent =
+    `⚠️ ${need.length} 个账号的 Cookie 已临期/失效，保活无法自动续期：${names}${more}`;
+}
 function accountIdentity(a, strong = false) {
   const avatar = esc(a.avatar_url || '/default-avatar.svg');
   const name = esc(a.name || '未命名账号');
@@ -259,6 +272,7 @@ async function loadAccounts() {
   try {
     const accounts = await api.get('/api/accounts');
     window.__accounts = accounts;
+    updateReloginBanner(accounts);
     const tb = $('#accTable tbody');
     tb.innerHTML = accounts.length ? accounts.map(a=>`
       <tr data-id="${a.id}">
@@ -270,6 +284,7 @@ async function loadAccounts() {
         <td>${a.proxy_label ? '<span class="badge">'+esc(a.proxy_label)+'</span>' : (a.proxy ? '<span class="badge">'+esc(a.proxy)+'</span>' : '<span class="badge gray">直连</span>')}</td>
         <td>${a.last_checkin||'从未'}</td>
         <td class="acc-actions">
+          ${a.needs_relogin ? `<button class="btn btn-primary btn-sm" data-action="relogin" data-id="${a.id}" title="${esc(a.relogin_reason||'Cookie 临期，扫码续期')}">🔄 续期</button>` : ''}
           <button class="btn btn-ghost btn-sm" data-action="toggle" data-id="${a.id}">${a.enabled?'停用':'启用'}</button>
           <button class="btn btn-ghost btn-sm" data-action="edit" data-id="${a.id}">编辑</button>
           <button class="btn btn-ghost btn-sm" data-action="verify" data-id="${a.id}">校验</button>
@@ -286,6 +301,7 @@ async function loadAccounts() {
       else if (action === 'edit') openAccModal(id);
       else if (action === 'verify') verifyAcc(id);
       else if (action === 'delete') delAcc(id);
+      else if (action === 'relogin') qrOpen();
     };
     $('#accCheckAll').checked = false;
     updateSelCount();
@@ -788,6 +804,8 @@ async function doQrImport() {
   }
 }
 $('#btn-qr-add').onclick = qrOpen;
+const btnReloginQr = $('#btn-relogin-qr');
+if (btnReloginQr) btnReloginQr.onclick = qrOpen;
 $('#qrModalClose').onclick = qrClose;
 $('#qrRefresh').onclick = () => { qrTimer && clearTimeout(qrTimer); loadQr(); };
 $('#qrImportBtn').onclick = doQrImport;
@@ -1026,6 +1044,18 @@ async function loadSettings() {
     $('#s-cookie_session_ttl_days').value = settingsCache.cookie_session_ttl_days||'7';
     $('#s-cookie_expiry_warn_days').value = settingsCache.cookie_expiry_warn_days||'2';
     $('#s-cookie_warn_cooldown_hours').value = settingsCache.cookie_warn_cooldown_hours||'12';
+    // 扫码续期 & 实验性 PC 端点换发（1.3.6）
+    $('#s-cookie_relogin_stale_hours').value = settingsCache.cookie_relogin_stale_hours||'48';
+    $('#s-panel_url').value = settingsCache.panel_url||'';
+    setVal('s-keepalive_passport_enabled', settingsCache.keepalive_passport_enabled==='1');
+    $('#s-keepalive_passport_urls').value = settingsCache.keepalive_passport_urls||'https://weibo.com/,https://passport.weibo.com/';
+    // 手机保活（1.3.7）
+    setVal('s-mobile_sync_enabled', settingsCache.mobile_sync_enabled==='1');
+    $('#s-mobile_sync_token').value = settingsCache.mobile_sync_token||'';
+    const mobileLast = $('#mobileLastInfo');
+    if (mobileLast) mobileLast.textContent = settingsCache.mobile_sync_last_at
+      ? ('最近同步：' + settingsCache.mobile_sync_last_at + ' · ' + (settingsCache.mobile_sync_last_result||''))
+      : 'App 端配置时粘贴此令牌；令牌仅能推送 Cookie，权限极小';
     // 网页终端（1.3.5）
     setVal('s-terminal_enabled', settingsCache.terminal_enabled==='1');
     // 推送模式：all / selected
@@ -1077,6 +1107,13 @@ function collectSettings() {
     cookie_session_ttl_days: val('s-cookie_session_ttl_days','7'),
     cookie_expiry_warn_days: val('s-cookie_expiry_warn_days','2'),
     cookie_warn_cooldown_hours: val('s-cookie_warn_cooldown_hours','12'),
+    // 扫码续期 & 实验性 PC 端点换发（1.3.6）
+    cookie_relogin_stale_hours: val('s-cookie_relogin_stale_hours','48'),
+    panel_url: val('s-panel_url').trim(),
+    keepalive_passport_enabled: chk('s-keepalive_passport_enabled'),
+    keepalive_passport_urls: val('s-keepalive_passport_urls').trim(),
+    // 手机保活（1.3.7）：令牌不在保存流程里，走专门按钮
+    mobile_sync_enabled: chk('s-mobile_sync_enabled'),
     // 网页终端（1.3.5）
     terminal_enabled: chk('s-terminal_enabled'),
   };
@@ -1090,6 +1127,26 @@ $('#btn-save-all').onclick = async () => {
     status.textContent = '✅ 已保存'; status.className='save-status ok';
     setTimeout(()=>status.textContent='',2500);
   } catch(e){ status.textContent='保存失败'; status.className='save-status'; }
+};
+// 手机保活（1.3.7）：令牌生成/复制
+var btnMobileTokenGen = $('#btn-mobile-token-gen');
+if (btnMobileTokenGen) btnMobileTokenGen.onclick = async () => {
+  if (!confirm('生成新令牌后旧令牌立即作废，手机 App 需要重新配置。继续？')) return;
+  try {
+    const r = await api.post('/api/mobile/token/regenerate', {});
+    $('#s-mobile_sync_token').value = r.token || '';
+    setVal('s-mobile_sync_enabled', true);
+    settingsCache = await api.get('/api/settings');
+    toast('已生成同步令牌（同步开关已开启）', 'good');
+  } catch(e) { toast('令牌生成失败', 'err'); }
+};
+var btnMobileTokenCopy = $('#btn-mobile-token-copy');
+if (btnMobileTokenCopy) btnMobileTokenCopy.onclick = () => {
+  const t = $('#s-mobile_sync_token').value.trim();
+  if (!t) { toast('尚未生成令牌', 'err'); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(()=>toast('令牌已复制','good'), ()=>toast('复制失败，请手动选择','err'));
+  } else { toast('请手动长按选择复制','err'); }
 };
 var saveScheduleBtn = $('#btn-save-schedule');
 if (saveScheduleBtn) saveScheduleBtn.onclick = async () => {

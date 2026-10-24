@@ -92,6 +92,38 @@ def cookie_expiry_view(acc: dict) -> dict:
     )
 
 
+def _parse_stamp(value) -> datetime | None:
+    try:
+        return datetime.strptime(str(value or "").strip()[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def needs_relogin_reason(acc: dict) -> str:
+    """判断账号是否已超出"自动保活能解决"的范围、需要人工扫码续期。
+
+    空串表示不需要。服务端保活只能换发微博主动下发的 Set-Cookie，
+    换不动时没有任何接口能凭旧凭据换新登录态，只能扫码重登：
+    - cookie_health == invalid：探活确认登录态已失效；
+    - 预计失效时间已过：保活还在跑，但换发一直没成功；
+    - 临期且超过 stale 小时仍无一次成功换发：继续等大概率等来失效。
+    """
+    if acc.get("cookie_health") == "invalid":
+        return "登录态已失效，请扫码续期"
+    view = cookie_expiry_view(acc)
+    state = view.get("state")
+    if state == "expired":
+        return "已到预计失效时间，保活换发未成功"
+    if state == "expiring":
+        stale_hours = _float_setting("cookie_relogin_stale_hours", 48)
+        rotated = _parse_stamp(acc.get("cookie_last_rotated_at"))
+        if rotated is None:
+            return "临期且从未成功换发，建议扫码续期"
+        if datetime.now() - rotated >= timedelta(hours=stale_hours):
+            return f"临期且已 {int(stale_hours)} 小时无成功换发，建议扫码续期"
+    return ""
+
+
 def keepalive_interval_hours(acc: dict) -> float:
     """自适应续期间隔：保证一个实测 session 寿命内至少成功换发 5 次，
     临近预计失效时自动加密抢救，连续失败则指数退避，别在代理抖动时猛撞接口。"""

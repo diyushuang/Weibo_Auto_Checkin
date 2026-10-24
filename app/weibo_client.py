@@ -779,6 +779,44 @@ def verify_cookie(session, cookies, channel="auto", proxy=None,
         raise NetworkError(f"验证 Cookie 响应异常：{safe_exc(exc)}") from exc
 
 
+def touch_passport_endpoints(session, cookies, urls, channel="auto", proxy=None,
+                             force=False, allow_fallback=True) -> list[str]:
+    """实验性（v1.3.6）：逐个请求 PC 端候选端点，尝试让微博换发新的登录凭据。
+
+    服务端保活平时只戳 m.weibo.cn，临期换不动时没有第二手段。这里对管理员
+    配置的 PC 端点（weibo.com 首页 / passport SSO 跳转等）各发一次带登录态的
+    GET，响应 Set-Cookie 落进账号专属 session 后由 harvest 机制统一回收。
+    微博没有公开承诺这些端点必然换发，有效性以 rotate-probe 实测为准。
+
+    返回实际请求成功的 URL 列表。每个 URL 出站前必须过 validate_weibo_url
+    白名单（非微博域 / 私网地址直接跳过）；单端点失败只记日志，绝不影响
+    保活主流程的判定 —— 实验手段不能反过来把账号观测搞脏。
+    """
+    touched = []
+    for raw in (urls or []):
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        try:
+            validate_weibo_url(url)
+        except Exception as exc:
+            log.warning("passport 换发跳过非法端点 %r：%s", url, safe_exc(exc))
+            continue
+        try:
+            # PC 端点返回的是 HTML 而非 JSON，直接走 request_via_proxy；
+            # cookies 已在 session jar 里，显式再带一份保证 m 域凭据同步携带。
+            request_via_proxy(
+                session, "GET", url, channel=channel, proxy=proxy,
+                force=force, allow_fallback=allow_fallback,
+                timeout=15, cookies=cookies,
+                headers={"Referer": BASE_PC + "/"},
+            )
+            touched.append(url)
+        except Exception as exc:
+            log.info("passport 换发端点请求失败 %s：%s", url, safe_exc(exc))
+    return touched
+
+
 def _normalize_topic_id(raw_id: str) -> str:
     """统一超话 containerid：微博 scheme 里常带 -feeds / %2B 等后缀，
     不归一会导致同一超话在去重表里出现多条记录（名字、头像各缺一半）。"""
