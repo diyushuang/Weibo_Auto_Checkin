@@ -2,6 +2,7 @@ name: build-apk
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
     paths: ['android-app/**', '.github/workflows/build-apk.yml']
   workflow_dispatch:
