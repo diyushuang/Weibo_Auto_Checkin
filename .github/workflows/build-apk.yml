@@ -34,8 +34,8 @@ jobs:
           set -e
           if [ $code -ne 0 ]; then
             # 测试失败：把 JUnit 报告的断言消息（含期望/实际值）转成注解
-            if ls android-app/app/build/test-results/testDebugUnitTest/*.xml >/dev/null 2>&1; then
-              grep -h -A 8 "<failure" android-app/app/build/test-results/testDebugUnitTest/*.xml \
+            if ls app/build/test-results/testDebugUnitTest/*.xml >/dev/null 2>&1; then
+              grep -h -A 8 "<failure" app/build/test-results/testDebugUnitTest/*.xml \
                 | head -80 | grep -vE '^\s*$' | while IFS= read -r line; do
                   printf '::error::TEST %s\n' "$(echo "$line" | sed 's/"/%22/g' | cut -c1-280)"
                 done

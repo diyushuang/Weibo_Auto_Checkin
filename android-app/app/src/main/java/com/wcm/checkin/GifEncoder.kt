@@ -243,7 +243,10 @@ object GifEncoder {
                 if (dictSize < 4096) {
                     dict[key] = dictSize
                     dictSize++
-                    if (dictSize == (1 shl codeSize) && codeSize < 12) codeSize++
+                    // 升位要晚一个表项：解码器每读一个码才补一个表项，天然比编码器
+                    // 慢一步；若在 dictSize==2^n 时立即升位，发出的第 (2^n-257) 个码
+                    // 就会比解码器多占一位（实测 Pillow 在跨 512 边界的第二帧报坏流）
+                    if (dictSize == (1 shl codeSize) + 1 && codeSize < 12) codeSize++
                 } else {
                     emit(256)                        // 字典满：清码重置
                     dict.clear()
