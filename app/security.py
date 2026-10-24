@@ -139,6 +139,15 @@ def validate_ai_base_url(base_url: str) -> str:
 # 微博签到允许的 host 后缀（checkin_topic 只允许跟随微博自家链接）
 WEIBO_HOSTS = ("weibo.cn", "weibo.com", "weibocdn.com")
 
+# 扫码登录的跨域同步回调还会落在新浪通行域（login.sina.com.cn 等），
+# 仅登录链路（qrcode/check 回调 / login_url）放宽到这组，其余出站仍用 WEIBO_HOSTS。
+WEIBO_LOGIN_HOSTS = WEIBO_HOSTS + ("sina.com.cn",)
+
 
 def validate_weibo_url(url: str) -> str:
     return validate_outbound_url(url, allowed_hosts=WEIBO_HOSTS)
+
+
+def validate_weibo_login_url(url: str) -> str:
+    """扫码登录链路的出站校验：微博自家域 + 新浪通行域，拒绝其余 host 与私网地址。"""
+    return validate_outbound_url(url, allowed_hosts=WEIBO_LOGIN_HOSTS)

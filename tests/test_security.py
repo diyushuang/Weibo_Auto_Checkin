@@ -101,6 +101,24 @@ def test_validate_weibo_allowlist():
         validate_weibo_url("http://127.0.0.1/x")  # 白名单外 + 本地地址
 
 
+def test_validate_weibo_login_allowlist(monkeypatch):
+    """扫码登录链路放行新浪通行域（login.sina.com.cn），域伪造仍拒绝。"""
+    import socket
+    from app.security import validate_weibo_login_url
+    # DNS 解析 mock 成公网地址，测试不依赖外网
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+    assert validate_weibo_login_url("https://passport.weibo.com/sso/v2/login").startswith("https://")
+    assert validate_weibo_login_url("https://login.sina.com.cn/sso/alt").startswith("https://")
+    # 后缀 / 前缀伪造不落入白名单
+    with pytest.raises(UnsafeURLError):
+        validate_weibo_login_url("https://sina.com.cn.evil.example/steal")
+    with pytest.raises(UnsafeURLError):
+        validate_weibo_login_url("https://evil-sina.com.cn/steal")
+    with pytest.raises(UnsafeURLError):
+        validate_weibo_login_url("http://192.168.0.10/internal")
+
+
 def test_checkin_topic_rejects_foreign_scheme():
     """微博返回的绝对 URL scheme 不得带 Cookie 访问外部主机。"""
     from app.weibo_client import checkin_topic

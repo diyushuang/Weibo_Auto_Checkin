@@ -307,6 +307,11 @@ def test_extract_weibo_profile_from_nested_payload():
 
 
 def test_cache_weibo_avatar_downloads_to_data_directory(tmp_path, monkeypatch):
+    import socket
+    # tvax.example.com 无真实解析，mock 成公网地址以通过出站守卫的 DNS 校验
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+
     png = (
         b"\x89PNG\r\n\x1a\n"
         b"\x00\x00\x00\rIHDR"
@@ -339,6 +344,10 @@ def test_cache_weibo_avatar_downloads_to_data_directory(tmp_path, monkeypatch):
 
 
 def test_cache_weibo_avatar_rejects_non_image(tmp_path, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+
     class Response:
         content = b"not an image"
         headers = {"content-type": "text/html"}
@@ -357,6 +366,48 @@ def test_cache_weibo_avatar_rejects_non_image(tmp_path, monkeypatch):
         "10001",
     ) == ""
     assert not (tmp_path / "avatars").exists()
+
+
+def test_cache_weibo_avatar_rejects_local_target(tmp_path, monkeypatch):
+    """头像地址指向本地/私网时不得发起下载（出站守卫，无需 DNS）。"""
+    class Session:
+        def get(self, url, **kwargs):
+            raise AssertionError("不应请求未通过出站校验的地址")
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "weibo_checkin.db")
+    assert accounts_api._cache_weibo_avatar(
+        Session(), "http://127.0.0.1:8000/steal.png", "10001") == ""
+    assert not (tmp_path / "avatars").exists()
+
+
+def test_complete_qr_login_skips_foreign_callback_hosts(monkeypatch):
+    """跨域回调只允许微博/新浪登录域：外部域与私网地址必须被跳过。"""
+    import socket
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+
+    requested = []
+
+    class Session:
+        cookies = []
+
+        def get(self, url, **kwargs):
+            requested.append(url)
+
+    item = {"alt": "https://login.sina.com.cn/sso/alt?x=1"}
+    payload = {"data": {"arrURL": [
+        "https://m.weibo.cn/crossdomain?from=weibo",
+        "https://evil.example.com/steal?cookie=1",
+        "http://192.168.0.10/internal",
+    ]}}
+    accounts_api._complete_qr_login(Session(), item, payload)
+
+    assert any("m.weibo.cn/crossdomain" in u for u in requested)
+    assert any("login.sina.com.cn" in u for u in requested)
+    assert not any("evil.example.com" in u for u in requested)
+    assert not any("192.168.0.10" in u for u in requested)
+    # 兜底的 m.weibo.cn/api/config 请求仍会发出
+    assert any(u.startswith("https://m.weibo.cn/api/config") for u in requested)
 
 
 def test_qr_finish_persists_profile_avatar_and_uid(client, monkeypatch):

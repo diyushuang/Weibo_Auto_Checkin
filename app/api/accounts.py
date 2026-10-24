@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .. import accounts_service, auth, database
 from .. import __version__
-from ..security import safe_exc, validate_weibo_url
+from ..security import safe_exc, validate_outbound_url, validate_weibo_login_url
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -274,7 +274,8 @@ def _extract_callback_urls(payload: dict) -> list[str]:
 def _complete_qr_login(session: requests.Session, item: dict, payload: dict) -> dict:
     """扫码确认后：访问所有回调 URL（含 arrURL/跨域同步）以落地各域 Cookie。
 
-    返回聚合后的 cookie 字典。
+    返回聚合后的 cookie 字典。回调 URL 来自微博响应，属不可信输入：
+    逐个过登录域出站守卫（仅微博/新浪登录域，拒绝私网地址），不合规的跳过。
     """
     urls = _extract_callback_urls(payload)
     fallback = item.get("alt")
@@ -283,9 +284,15 @@ def _complete_qr_login(session: requests.Session, item: dict, payload: dict) -> 
     log.info("扫码确认回调 URL 数：%d", len(urls))
     for u in urls:
         try:
+            u = validate_weibo_login_url(u)
+        except ValueError:
+            log.warning("扫码回调 URL 未通过出站校验，已跳过：host=%s",
+                        urlparse(u or "").hostname or "?")
+            continue
+        try:
             session.get(u, timeout=15, allow_redirects=True)
         except requests.RequestException as exc:
-            log.warning("回调 %s 异常：%s", u, exc)
+            log.warning("回调 %s 异常：%s", u, safe_exc(exc))
     # 兜底：触发 m.weibo.cn 跨域写 cookie（SSOLoginState/WEIBOCN_FROM/MLOGIN 等）
     try:
         session.get("https://m.weibo.cn/api/config", timeout=10, allow_redirects=True)
@@ -391,8 +398,8 @@ def get_qr_login_status(session_id: str, user: dict = Depends(auth.require_admin
     login_url = data.get("url") or data.get("alt") or item.get("alt")
     if login_url:
         try:
-            # 登录跳转 URL 来自微博响应，限定微博自家 host
-            session.get(validate_weibo_url(login_url), timeout=15, allow_redirects=True)
+            # 登录跳转 URL 来自微博响应，限定微博/新浪登录域（跨域同步可落 login.sina.com.cn）
+            session.get(validate_weibo_login_url(login_url), timeout=15, allow_redirects=True)
         except (requests.RequestException, ValueError) as exc:
             raise HTTPException(502, f"完成微博登录失败：{safe_exc(exc)}") from exc
 
@@ -481,6 +488,15 @@ def _detect_image_ext(content: bytes) -> str | None:
 def _cache_weibo_avatar(session, avatar_url: str, uid: str = "") -> str:
     """下载微博头像到持久化 data/avatars 目录并返回本地访问地址。"""
     if not avatar_url or not avatar_url.startswith(("http://", "https://")):
+        return ""
+
+    try:
+        # 头像地址来自微博资料响应，属不可信输入：与 topics 图片代理同一套出站守卫
+        # （scheme 校验 + 拒绝本地/私有/保留地址）。头像 CDN 域不固定，故不做 host 白名单。
+        avatar_url = validate_outbound_url(avatar_url)
+    except ValueError:
+        log.warning("头像地址未通过出站校验，已跳过：host=%s",
+                    urlparse(avatar_url or "").hostname or "?")
         return ""
 
     try:
