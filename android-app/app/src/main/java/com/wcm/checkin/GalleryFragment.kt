@@ -69,6 +69,14 @@ class GalleryFragment : Fragment() {
         view.findViewById<TextView>(R.id.crawlLog).text = logBuffer
     }
 
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        if (!hidden && isAdded) {
+            renderDir()
+            renderTargets()
+        }
+    }
+
     private fun toast(text: String) = Toast.makeText(requireContext(), text, Toast.LENGTH_SHORT).show()
 
     private fun renderDir() {
@@ -281,12 +289,15 @@ class GalleryFragment : Fragment() {
     }
 
     private suspend fun startSingle(bid: String) {
-        if (busy) return
-        busy = true
-        withContext(Dispatchers.Main) {
+        // busy 只在主线程读写，避免并发点击下双重启动
+        val gate = withContext(Dispatchers.Main) {
+            if (busy) return@withContext false
+            busy = true
             view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = false
             view?.findViewById<View>(R.id.btnSinglePost)?.isEnabled = false
+            true
         }
+        if (!gate) return
         try {
             Crawler.crawlSinglePost(requireContext(), bid, ::log)
         } catch (e: CancellationException) {

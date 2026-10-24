@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 不覆写 statusBarColor：跟随主题/动态取色，targetSdk 35 的边到边由
+         MainActivity 的 insets 监听统一处理（fitsSystemWindows 已过时）。 -->
     <style name="Theme.Wcm" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/brand</item>
         <item name="colorPrimaryDark">@color/brand_dark</item>
-        <item name="android:statusBarColor">@color/brand_dark</item>
         <item name="android:windowBackground">?android:attr/colorBackground</item>
     </style>
 </resources>

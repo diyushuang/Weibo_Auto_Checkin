@@ -33,15 +33,13 @@ class LoginWebViewActivity : AppCompatActivity() {
 
         val cm = CookieManager.getInstance()
         // 每次进入都是干净会话：添加第二个账号时不继承第一个的登录
-        cm.removeAllCookies {
-            cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(webView, true)
-        }
+        cm.setAcceptCookie(true)
+        cm.setAcceptThirdPartyCookies(webView, true)
+        cm.removeAllCookies(null)
 
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            userAgentString = webView.settings.userAgentString
         }
         webView.webViewClient = android.webkit.WebViewClient()
 
@@ -118,6 +116,8 @@ class LoginWebViewActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        webView.stopLoading()
+        webView.destroy()
         super.onDestroy()
     }
 }

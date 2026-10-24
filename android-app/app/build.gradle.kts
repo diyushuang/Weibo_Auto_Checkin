@@ -5,14 +5,14 @@ plugins {
 
 android {
     namespace = "com.wcm.checkin"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.wcm.checkin"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 4
-        versionName = "0.3.1"
+        targetSdk = 35
+        versionCode = 5
+        versionName = "0.3.2"
     }
 
     buildTypes {
