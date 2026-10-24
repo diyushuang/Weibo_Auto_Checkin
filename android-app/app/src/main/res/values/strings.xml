@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">微博签到</string>
+
+    <!-- 底部导航 -->
+    <string name="nav_home">首页</string>
+    <string name="nav_gallery">图片</string>
+    <string name="nav_settings">设置</string>
+
+    <!-- 通用 -->
+    <string name="busy">正在运行中…</string>
+    <string name="log_empty">（暂无日志）</string>
+
+    <!-- 首页 -->
+    <string name="home_summary_empty">还没有账号，点「＋ 添加账号」用微博官方页面登录</string>
+    <string name="home_summary_fmt">%1$d 个账号 · 面板同步：%2$s · 后台每 6 小时保活</string>
+    <string name="home_panel_ok">已配置</string>
+    <string name="home_panel_off">未配置</string>
+    <string name="home_account_empty">点右上「＋ 添加账号」开始</string>
+    <string name="home_no_account">没有账号，请先「＋ 添加账号」</string>
+    <string name="home_cookie_dead">Cookie 已失效，请删除后重新添加账号</string>
+    <string name="home_delete_title">删除账号 %1$s?</string>
+    <string name="home_delete_msg">只删除本机存储的登录态，不影响面板。</string>
+    <string name="btn_checkin">立即签到</string>
+    <string name="btn_sync">仅同步面板</string>
+    <string name="btn_add">＋ 添加账号</string>
+    <string name="accounts_label">账号</string>
+    <string name="log_label">运行日志</string>
+    <string name="auto_on_open">打开 App 即自动签到</string>
+    <string name="login_hint">在下方页面登录微博（账密 / 验证码均在微博官方页面完成，本应用不经手）；登录成功后会自动返回。</string>
+
+    <!-- 图片页 -->
+    <string name="crawl_intro">自动抓取目标博主全部原创微博的原图（原始分辨率），Live Photo 自动转 GIF；同名跳过、断点续跑。</string>
+    <string name="crawl_dir_title">保存到相册目录</string>
+    <string name="crawl_dir_empty">未选择（点击右边按钮选择）</string>
+    <string name="crawl_pick_dir">选择目录</string>
+    <string name="crawl_dir_saved">相册目录已保存</string>
+    <string name="crawl_targets_title">抓取目标</string>
+    <string name="crawl_add_target">＋ 添加博主（UID / 主页链接 / 个性域名）</string>
+    <string name="crawl_add_title">添加抓取目标</string>
+    <string name="crawl_target_empty">还没有目标，点上方按钮添加</string>
+    <string name="crawl_remove_title">移除目标 %1$s?</string>
+    <string name="crawl_remove_msg">已下载的文件不受影响；进度保留，重新添加后继续增量。</string>
+    <string name="crawl_auto_after_checkin">每次签到完成后自动增量抓取</string>
+    <string name="crawl_start">开始抓取（增量）</string>
+    <string name="crawl_stop">停止</string>
+    <string name="crawl_log_title">抓取日志</string>
+    <string name="crawl_need_target">请先添加抓取目标</string>
+    <string name="crawl_need_dir">请先选择相册目录</string>
+
+    <!-- 设置页 -->
+    <string name="settings_panel_title">面板同步</string>
+    <string name="settings_panel_url_hint">面板地址（https://…）</string>
+    <string name="settings_panel_token_hint">同步令牌（面板 → 设置 → 手机保活 → 生成）</string>
+    <string name="settings_save">保存</string>
+    <string name="settings_saved">已保存</string>
+    <string name="settings_panel_note">配置后 App 每 6 小时把最新 Cookie 推送到面板，自动覆盖同微博号账号；留空则只在本地签到。</string>
+    <string name="settings_behavior_title">行为</string>
+    <string name="settings_live_gif">Live Photo 转 GIF（关闭则保存原始视频）</string>
+    <string name="settings_about_title">关于</string>
+    <string name="settings_about_body">微博签到 App v%1$s\n真机签到 · 登录态同步 · 原图抓取\n权限：仅 INTERNET</string>
+</resources>

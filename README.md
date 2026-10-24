@@ -9,6 +9,7 @@
 - 📱 **微博扫码添加账号**：弹二维码 → 微博 App 扫码确认 → 自动获取 Cookie
 - 🍪 **Cookie 生成器**：粘贴 Cookie 自动解析，一键导入账号
 - 🕓 **Cookie 智能保活**：自适应间隔 + 随机抖动 + 临期自动加密 + 真实业务流量掺入 + 夜间静默，尽量把登录态续得更久
+- 🔄 **Cookie 临期扫码续期**：保活换发无效时，面板横幅 / 账号行「续期」按钮 / TG 预警（可附带面板链接）引导重新扫码；新 Cookie 自动覆盖同微博号的原账号，代理、备注、启用状态全部保留，无需删除重建
 - ⏰ **自动定时签到**：Cron 可配（支持 5 段 / 6 段青龙格式）
 - ✅ **已签自动跳过**：不重复签到
 - 🛡️ **防封策略**：凌晨窗口随机等待、SOCKS5 代理池、失败回退、三遍重试
@@ -114,6 +115,7 @@ python mini_client.py checkin                    # 全部启用账号签到一�
 python mini_client.py keepalive                  # 到期账号保活（--force 立即全量）
 python mini_client.py topics refresh             # 抓取关注超话并更新缓存
 python mini_client.py topics list                # 查看超话缓存
+python mini_client.py rotate-probe               # 实验性：探测 PC 端点能否换发 Cookie
 python mini_client.py checkin --json             # 机器可读输出
 ```
 
@@ -163,6 +165,64 @@ docker exec -it weibo-checkin python mini_client.py topics list
 
 ⚠️ 公网部署时请务必保持强口令 + HTTPS（反代需支持 WebSocket 透传），
 不要在不受信任的网络环境下开启该功能。
+
+## 🔄 Cookie 临期扫码续期（v1.3.6）
+
+微博服务端 session 实测约 7 天，保活的本质是「带旧凭据访问 → 收下响应里
+换发的新凭据」。但换发不保证一直成功——临期却续不动时，**扫码重登是唯一
+可靠手段**（微博没有凭旧 Cookie 静默换新的公开接口，账密自动重登又需要
+存密码且风控风险高）。v1.3.6 把这条人工链路做成了闭环：
+
+1. **检测**：账号失效 / 已到预计失效时间 / 临期且超过 `cookie_relogin_stale_hours`
+   （默认 48 小时）仍无成功换发时，判定为「需要扫码续期」；
+2. **引导**：账号管理页顶部出现横幅、账号行出现「🔄 续期」按钮、TG 预警
+   （`panel_url` 设置了面板地址时会附带链接，手机上点开即可）；
+3. **接管**：点按钮弹出现有扫码弹窗，扫码确认后新 Cookie **自动覆盖同微博号
+   的原账号**（按 weibo_uid / SUB 匹配），代理、备注、启用状态保留，生命周期
+   基准自动重置，无需删除重建。
+
+### 实验性：PC 端点静默换发
+
+设置里默认关闭的「实验性 PC 端点换发」会在临期保活轮追加请求 PC 端候选端点
+（`keepalive_passport_urls`，仅允许微博域名，强制出站白名单校验），尝试让
+微博在响应里换发新凭据。微博未承诺这些端点的有效性，请先用 CLI 实测：
+
+```bash
+python mini_client.py rotate-probe            # 只探测临期账号
+python mini_client.py rotate-probe --all      # 探测全部启用账号
+python mini_client.py rotate-probe --urls "https://weibo.com/,https://passport.weibo.com/"
+```
+
+probe 会逐端点打印换发了哪些 cookie 字段并把新凭据回写数据库（CAS 保护），
+结尾给出「哪些端点有效、建议保留在设置里」的汇总。实测确认有效后再打开
+设置开关。
+
+## 📲 手机 App：真机签到 + 登录态根（v1.3.7）
+
+把登录态的「根」放到手机上：App 内用微博官方页面登录一次（账密不经本应用），
+之后：
+
+- **打开 App 即自动签到**：真机 + 家宽/移动网络直接请求 m.weibo.cn，逐账号
+  列超话 → 对未签的超话随机间隔 3-8 秒逐个签到（已签自动跳过，与面板互相幂等）；
+- **📷 原图抓取（App v0.3.0）**：Material 3 界面（底部导航：首页 / 图片 / 设置，
+  Android 12+ 自动跟随系统取色）。添加博主（UID/主页链接/个性域名）并选择相册目录后，
+  一键增量抓取其全部原创微博的原图（`/large/` 原始分辨率），**Live Photo 在端内
+  转 GIF**（自研 GIF89a 编码器：中值切分 256 色调色板 + LZW + Bayer 抖动，
+  12fps/长边 640，与 ffmpeg 方案同口径，转换失败自动回退保存原始视频），
+  按日期命名平铺进所选目录；同名跳过、断点续跑，可开启「签到后自动抓取」；
+- **后台每 6 小时保活轮换**：WorkManager 静默探活并收下微博换发的新 Cookie，
+  跨重启自动持久化（无需开机自启权限）；
+- **同步面板**：配置面板地址 + 同步令牌后，App 定期把最新 Cookie 推送到面板
+  `POST /api/mobile/sync`，自动覆盖同微博号账号并重置生命周期基准——手机在，
+  面板的 Cookie 就永远新鲜。
+
+面板侧配置：**设置 → 手机保活** → 打开开关 → 「生成 / 重新生成」令牌并复制，
+填进 App 的「面板设置」即可。令牌权限极小（只能推送 Cookie），错误尝试按 IP
+限流；探活失败的 Cookie 不会覆盖面板上仍健康的账号。
+
+App 工程在 `android-app/`（Kotlin，仅 `INTERNET` 权限），APK 由 GitHub Actions
+自动构建（`.github/workflows/build-apk.yml`，Actions 页面下载 `wcm-app-debug`
+产物）；也可以用 Android Studio 直接打开构建。
 
 ## 🎯 使用
 

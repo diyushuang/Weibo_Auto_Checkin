@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 手机 App 只需要联网权限：登录态保存在应用私有存储，调度由 WorkManager
+         跨重启自动持久化，无开机自启 / 存储 / 定位等任何其它权限。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:name=".WcmApp"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.Wcm"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".LoginWebViewActivity"
+            android:exported="false" />
+    </application>
+</manifest>
