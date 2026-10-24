@@ -7,11 +7,10 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
-import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.bottomnavigation.BottomNavigationView
 
 /**
- * 单 Activity 壳：顶部标题 + 底部导航（首页 / 图片 / 设置），Material 3。
+ * 单 Activity 壳：底部导航（首页 / 图片 / 设置），Material 3。
  *
  * 三个页面用 add + show/hide 常驻（不 replace）：切换 Tab 不会销毁视图与
  * 进行中的签到/抓取协程，滚动位置与日志也得以保留。
@@ -67,16 +66,18 @@ class MainActivity : AppCompatActivity() {
             .commit()
     }
 
-    /** targetSdk 35 起系统强制边到边：手动给工具栏/底部导航让出系统栏内边距。 */
+    /** targetSdk 35 起系统强制边到边：给内容区让出状态栏/挖孔（含横屏侧挖孔）
+     *  与底部导航栏的内边距。 */
     private fun applyEdgeToEdgeInsets() {
-        val toolbar = findViewById<MaterialToolbar>(R.id.toolbar)
         val nav = findViewById<BottomNavigationView>(R.id.bottomNav)
         val root = findViewById<View>(R.id.rootLayout)
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val bars = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             )
-            toolbar.updatePadding(top = bars.top)
+            // 横屏时挖孔/手势条在左右两侧，同样要让位（全面屏中间挖孔在竖屏时
+            // 计入 bars.top，横屏时计入 left/right）
+            root.updatePadding(top = bars.top, left = bars.left, right = bars.right)
             nav.updatePadding(bottom = bars.bottom)
             WindowInsetsCompat.CONSUMED
         }

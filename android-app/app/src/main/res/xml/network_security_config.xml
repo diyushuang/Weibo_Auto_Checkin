@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 面板地址由用户在设置页自行填写，自建面板通常部署在局域网 HTTP（如
+     http://192.9.x.x:8080），无法预先枚举域名/IP，因此全局放行明文流量。
+     放行仅意味着允许发起 http:// 请求，微博接口仍全程 HTTPS，不受影响。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

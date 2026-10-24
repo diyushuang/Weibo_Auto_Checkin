@@ -177,16 +177,24 @@
                     android:text="@string/crawl_log_title"
                     android:textAppearance="@style/TextAppearance.Material3.TitleMedium" />
 
-                <TextView
-                    android:id="@+id/crawlLog"
+                <!-- 固定高度的滚动日志窗：只占屏一部分，最新的在最上面，
+                     旧日志在窗内向下滚动查看，页面本身不被日志撑长。 -->
+                <ScrollView
+                    android:id="@+id/crawlLogScroll"
                     android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
+                    android:layout_height="240dp"
                     android:layout_marginTop="8dp"
-                    android:fontFamily="monospace"
-                    android:minHeight="160dp"
-                    android:textSize="12sp"
-                    android:textColor="@color/text_secondary"
-                    android:text="@string/log_empty" />
+                    android:fillViewport="true">
+
+                    <TextView
+                        android:id="@+id/crawlLog"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="monospace"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:text="@string/log_empty" />
+                </ScrollView>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
     </LinearLayout>

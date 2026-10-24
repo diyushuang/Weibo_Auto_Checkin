@@ -1,10 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <!-- 不覆写 statusBarColor：跟随主题/动态取色，targetSdk 35 的边到边由
          MainActivity 的 insets 监听统一处理（fitsSystemWindows 已过时）。 -->
     <style name="Theme.Wcm" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/brand</item>
         <item name="colorPrimaryDark">@color/brand_dark</item>
         <item name="android:windowBackground">?android:attr/colorBackground</item>
+        <!-- 全面屏挖孔（刘海/中间打孔）：内容延伸进挖孔区渲染，由 insets 监听
+             给状态栏/侧边让位，而不是在挖孔侧留黑边。API 27+ 生效，26 忽略。 -->
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">
+            shortEdges
+        </item>
+        <!-- 日间浅色背景 → 状态栏图标用深色，保证时间/电量等与底色对比清晰；
+             夜间在 values-night/themes.xml 覆写为浅色图标。 -->
+        <item name="android:windowLightStatusBar">true</item>
     </style>
 </resources>

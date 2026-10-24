@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -158,14 +159,16 @@ class GalleryFragment : Fragment() {
         val host = view ?: return
         host.post {
             synchronized(logBuffer) {
-                logBuffer.append("[").append(timeFmt.format(Date())).append("] ")
-                    .append(line).append('\n')
+                // 最新的在最上面：新行插到缓冲区头部，超限裁掉尾部最旧的
+                val entry = "[${timeFmt.format(Date())}] $line\n"
+                logBuffer.insert(0, entry)
                 val parts = logBuffer.toString().split('\n')
                 if (parts.size > 400) {
                     logBuffer.setLength(0)
-                    logBuffer.append(parts.takeLast(400).joinToString("\n"))
+                    logBuffer.append(parts.take(400).joinToString("\n"))
                 }
                 host.findViewById<TextView>(R.id.crawlLog).text = logBuffer
+                host.findViewById<ScrollView>(R.id.crawlLogScroll).scrollTo(0, 0)
             }
         }
     }

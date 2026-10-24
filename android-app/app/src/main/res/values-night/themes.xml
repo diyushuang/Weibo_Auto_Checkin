@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 夜间深色背景 → 状态栏图标改用浅色（时间/电量等），
+         与日间的深色图标（values/themes.xml）共同保证与底色的鲜明对比。 -->
+    <style name="Theme.Wcm" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brand</item>
+        <item name="colorPrimaryDark">@color/brand_dark</item>
+        <item name="android:windowBackground">?android:attr/colorBackground</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">
+            shortEdges
+        </item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

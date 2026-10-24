@@ -17,7 +17,9 @@ import java.io.IOException
  * 4. 原图 = wx{1..4}.sinaimg.cn/large/<PID>.jpg（接口给的 mw2000 是缩图）；
  * 5. Live 的 mov 内层直链 403，必须走 video.weibo.com/media/play?livephoto= 包装地址；
  * 6. 置顶老帖永远在第 1 页，不参与"翻到底"判定；连续 10 条已完成的帖才停止翻页；
- * 7. 节流：下载间 600-900ms、详情间 ≥620ms、翻页间 ≥700ms。
+ * 7. 节流：下载间 600-900ms、详情间 ≥620ms、翻页间 ≥700ms；
+ * 8. 单文件下载失败自动重试 3 次（间隔递增），重试与失败原因写入日志；
+ *    相册目录已有同名文件时跳过下载并在日志注明排除原因。
  *
  * 下载阶段对 CDN 完全匿名（不带 Cookie）；所有出站 URL 过微博域名白名单。
  * v0.3.1：支持单条微博抓取（crawlSinglePost），幂等靠文件名，不占用增量进度。
@@ -66,7 +68,14 @@ object Crawler {
 
     private const val MAX_PAGES = 200          // 单账号安全上限（每页 10 条，2000 帖）
     private const val STOP_AFTER_DONE = 10     // 连续 N 条已完成帖 → 判定增量结束
+    private const val DOWNLOAD_ATTEMPTS = 3    // 单文件下载尝试次数（CDN 偶发 403/超时自动重试）
     private val LIVE_WRAPPER = "https://video.weibo.com/media/play?livephoto="
+
+    /** 大文件下载专用 client：Live mov 可达 64MB，放宽全局 client 的 25s callTimeout。 */
+    private val downloadClient = WeiboApi.client.newBuilder()
+        .callTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
     private fun safeName(raw: String): String =
         raw.replace(Regex("[\\\\/:*?\"<>|\\s]+"), "").ifEmpty { "微博" }
@@ -138,6 +147,7 @@ object Crawler {
 
     /**
      * 按序下载一帖全部资产。already = 该帖已完成的文件序号（断点续跑跳过前 N 个）。
+     * 下载前查重：相册目录已有同名文件则跳过并写明原因；下载失败自动重试。
      * 返回 (新落盘数, 完成序号)。
      */
     private suspend fun saveAssetSequence(
@@ -152,33 +162,36 @@ object Crawler {
         var saved = 0
         for (i in assets.picIds.indices) {
             val stillName = String.format("%s_%02d.jpg", prefix, i + 1)
-            if (seq++ < already || store.hasFile(stillName)) {
-            } else {
-                val bytes = fetchBytes(WeiboApi.originalImageUrl(assets.picIds[i]))
-                if (bytes != null && store.save(ctx.contentResolver, stillName, "image/jpeg", bytes)) {
-                    saved++
-                } else {
-                    log("  ✗ $stillName 下载失败")
+            when {
+                seq++ < already -> {}   // 断点续跑：此序号此前已完成
+                store.hasFile(stillName) ->
+                    log("  ↷ 排除重复 $stillName（相册目录已存在同名文件）")
+                else -> {
+                    val bytes = fetchBytes(WeiboApi.originalImageUrl(assets.picIds[i]), stillName, log)
+                    if (bytes != null) {
+                        if (store.save(ctx.contentResolver, stillName, "image/jpeg", bytes)) saved++
+                        else log("  ✗ $stillName 写入相册目录失败")
+                    }
+                    kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
                 }
-                kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
             }
             assets.liveByIndex[i]?.let { wrapper ->
                 val liveBase = String.format("%s_%02d_live", prefix, i + 1)
-                if (seq++ < already) {
-                } else if (saveLive(ctx, store, liveBase, wrapper)) {
-                    saved++
-                } else {
-                    log("  ✗ ${liveBase}.gif/.mov 保存失败")
+                when {
+                    seq++ < already -> {}
+                    store.hasFile("$liveBase.gif") || store.hasFile("$liveBase.mov") ->
+                        log("  ↷ 排除重复 $liveBase.gif/.mov（相册目录已存在同名文件）")
+                    saveLive(ctx, store, liveBase, wrapper, log) -> saved++
                 }
             }
         }
         assets.liveExtras.forEachIndexed { n, wrapper ->
             val liveBase = String.format("%s_live%02d", prefix, n + 1)
-            if (seq++ < already) {
-            } else if (saveLive(ctx, store, liveBase, wrapper)) {
-                saved++
-            } else {
-                log("  ✗ ${liveBase}.gif/.mov 保存失败")
+            when {
+                seq++ < already -> {}
+                store.hasFile("$liveBase.gif") || store.hasFile("$liveBase.mov") ->
+                    log("  ↷ 排除重复 $liveBase.gif/.mov（相册目录已存在同名文件）")
+                saveLive(ctx, store, liveBase, wrapper, log) -> saved++
             }
         }
         return saved to seq
@@ -193,8 +206,9 @@ object Crawler {
         store: TreeStore,
         baseName: String,
         wrapperUrl: String,
+        log: (String) -> Unit,
     ): Boolean {
-        val mov = fetchBytes(wrapperUrl)
+        val mov = fetchBytes(wrapperUrl, "$baseName.mov", log)
         if (mov == null) {
             kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
             return false
@@ -205,8 +219,10 @@ object Crawler {
                 kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
                 return true
             }
+            if (gif == null) log("  ↷ $baseName GIF 转换失败，回退保存原始 mov")
         }
         val ok = store.save(ctx.contentResolver, "$baseName.mov", "video/quicktime", mov)
+        if (!ok) log("  ✗ $baseName.mov 写入相册目录失败")
         kotlinx.coroutines.delay(kotlin.random.Random.nextLong(600, 900))
         return ok
     }
@@ -397,23 +413,45 @@ object Crawler {
         return saved
     }
 
-    /** 匿名下载（CDN 不需要登录态）。URL 必须过微博域名白名单；上限 64MB。 */
-    private fun fetchBytes(rawUrl: String): ByteArray? {
+    /** 匿名下载（CDN 不需要登录态）。URL 必须过微博域名白名单；上限 64MB。
+     *  失败自动重试 DOWNLOAD_ATTEMPTS 次（间隔递增），重试过程与原因都写入日志。 */
+    private suspend fun fetchBytes(rawUrl: String, label: String, log: (String) -> Unit): ByteArray? {
+        var reason = "未知错误"
+        for (attempt in 1..DOWNLOAD_ATTEMPTS) {
+            if (attempt > 1) {
+                kotlinx.coroutines.delay(1200L * (attempt - 1))
+            }
+            val (bytes, why) = tryDownload(rawUrl)
+            if (bytes != null) return bytes
+            reason = why
+            if (attempt < DOWNLOAD_ATTEMPTS) {
+                log("  ↻ $label 下载失败（第 $attempt 次：$reason），重试…")
+            }
+        }
+        log("  ✗ $label 下载失败（$reason，已尝试 $DOWNLOAD_ATTEMPTS 次）")
+        return null
+    }
+
+    /** 单次下载尝试：返回 (字节, 失败原因)。成功时原因为空串。 */
+    private fun tryDownload(rawUrl: String): Pair<ByteArray?, String> {
         return try {
             val url = WeiboApi.weiboUrl(rawUrl)
             val request = okhttp3.Request.Builder()
                 .url(url)
                 .header("User-Agent", "okhttp")
                 .build()
-            WeiboApi.client.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val body = resp.body ?: return null
+            downloadClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return null to "HTTP ${resp.code}"
+                val body = resp.body ?: return null to "空响应"
                 val bytes = body.bytes()
-                if (bytes.size > 64 * 1024 * 1024) return null
-                bytes
+                when {
+                    bytes.isEmpty() -> null to "空文件"
+                    bytes.size > 64 * 1024 * 1024 -> null to "超过 64MB 上限"
+                    else -> bytes to ""
+                }
             }
         } catch (e: Exception) {
-            null
+            null to (e.message ?: e.javaClass.simpleName)
         }
     }
 }

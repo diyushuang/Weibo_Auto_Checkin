@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.fragment.app.Fragment
@@ -136,13 +137,15 @@ class HomeFragment : Fragment() {
         val host = view ?: return
         host.post {
             synchronized(logBuffer) {
-                logBuffer.append(line).append('\n')
+                // 最新的在最上面：新行插到缓冲区头部，超限裁掉尾部最旧的
+                logBuffer.insert(0, "$line\n")
                 val parts = logBuffer.toString().split('\n')
                 if (parts.size > 400) {
                     logBuffer.setLength(0)
-                    logBuffer.append(parts.takeLast(400).joinToString("\n"))
+                    logBuffer.append(parts.take(400).joinToString("\n"))
                 }
                 host.findViewById<TextView>(R.id.logView).text = logBuffer
+                host.findViewById<ScrollView>(R.id.logScroll).scrollTo(0, 0)
             }
         }
     }
