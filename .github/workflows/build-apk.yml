@@ -54,7 +54,8 @@ jobs:
           fi
 
       - name: Upload APK
-        uses: actions/upload-artifact@v5
+        # v6 起默认 Node 24 运行时（v4/v5 仍 Node 20，触发弃用警告）
+        uses: actions/upload-artifact@v7
         with:
           name: wcm-app-debug
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
