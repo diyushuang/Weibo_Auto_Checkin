@@ -132,7 +132,7 @@ function check(name, cond) {
   check('倒计时已渲染', /小时|分|秒|即将/.test(window.document.querySelector('#schedCountdown').textContent));
 
   console.log('— 导航 —');
-  check('6 个导航项（含 1.0.0 超话）', window.document.querySelectorAll('.nav-item').length === 6);
+  check('7 个导航项（含超话与终端）', window.document.querySelectorAll('.nav-item').length === 7);
 
   console.log('— 账号管理 —');
   const navAccounts = window.document.querySelector('.nav-item[data-view="accounts"]');
@@ -195,8 +195,8 @@ function check(name, cond) {
   check('设置页有保存操作区', !!window.document.querySelector('.settings-save'));
 
   const pageHtml = window.document.documentElement.outerHTML;
-  check('样式缓存版本为 1.3.4', pageHtml.includes('/style.css?v=1.3.4'));
-  check('脚本缓存版本为 1.3.4', pageHtml.includes('/app.js?v=1.3.4'));
+  check('样式缓存版本为 1.3.5', pageHtml.includes('/style.css?v=1.3.5'));
+  check('脚本缓存版本为 1.3.5', pageHtml.includes('/app.js?v=1.3.5'));
 
   console.log('— 弹窗 —');
   window.document.querySelector('.nav-item[data-view="accounts"]').click();

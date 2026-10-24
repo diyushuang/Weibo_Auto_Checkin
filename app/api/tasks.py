@@ -166,6 +166,8 @@ def update_settings(values: dict, user: dict = Depends(auth.require_admin)):
         "keepalive_gap_seconds",
         "keepalive_max_per_tick", "cookie_session_ttl_days",
         "cookie_expiry_warn_days", "cookie_warn_cooldown_hours",
+        # v1.3.5 网页终端
+        "terminal_enabled",
     }
     updates = {k: v for k, v in values.items() if k in known}
     database.set_settings(updates)

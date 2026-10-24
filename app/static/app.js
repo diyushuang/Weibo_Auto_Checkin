@@ -42,7 +42,7 @@ themeSel.onchange = () => {
 };
 
 /* ===== 导航 ===== */
-const VIEW_TITLES = {dashboard:'仪表盘', accounts:'账号管理', topics:'超话', proxies:'代理', logs:'签到日志', settings:'设置'};
+const VIEW_TITLES = {dashboard:'仪表盘', accounts:'账号管理', topics:'超话', terminal:'客户端', proxies:'代理', logs:'签到日志', settings:'设置'};
 $$('.nav-item').forEach(btn => {
   btn.onclick = () => {
     $$('.nav-item').forEach(b=>b.classList.remove('active'));
@@ -58,6 +58,7 @@ $$('.nav-item').forEach(btn => {
     if (btn.dataset.view === 'dashboard') loadDashboard();
     if (btn.dataset.view === 'accounts') loadAccounts();
     if (btn.dataset.view === 'topics') loadTopics();
+    if (btn.dataset.view === 'terminal') initTerminalView();
     if (btn.dataset.view === 'proxies') loadProxies();
     if (btn.dataset.view === 'logs') loadLogs();
     if (btn.dataset.view === 'settings') loadSettings();
@@ -1025,6 +1026,8 @@ async function loadSettings() {
     $('#s-cookie_session_ttl_days').value = settingsCache.cookie_session_ttl_days||'7';
     $('#s-cookie_expiry_warn_days').value = settingsCache.cookie_expiry_warn_days||'2';
     $('#s-cookie_warn_cooldown_hours').value = settingsCache.cookie_warn_cooldown_hours||'12';
+    // 网页终端（1.3.5）
+    setVal('s-terminal_enabled', settingsCache.terminal_enabled==='1');
     // 推送模式：all / selected
     if ($('#s-topics_daily_push_mode')) {
       $('#s-topics_daily_push_mode').value = settingsCache.topics_daily_push_mode||'all';
@@ -1074,6 +1077,8 @@ function collectSettings() {
     cookie_session_ttl_days: val('s-cookie_session_ttl_days','7'),
     cookie_expiry_warn_days: val('s-cookie_expiry_warn_days','2'),
     cookie_warn_cooldown_hours: val('s-cookie_warn_cooldown_hours','12'),
+    // 网页终端（1.3.5）
+    terminal_enabled: chk('s-terminal_enabled'),
   };
 }
 $('#btn-save-all').onclick = async () => {
@@ -1343,6 +1348,7 @@ async function openTopicDetail(topicId, el, forceRefresh = false) {
   var nameFromAttr = el ? el.getAttribute('data-name') : '';
   var cached = (topicsCache || []).find(function(t) { return t.topic_id === topicId; });
   currentTopicName = nameFromAttr || (cached ? cached.name : topicId);
+  rememberRecentTopic(topicId, currentTopicName);
 
   // 高亮当前选中
   document.querySelectorAll('.topic-list-item').forEach(item => {
@@ -1930,6 +1936,336 @@ function observeNewReveal(root){
   if (!revealObserver) { setupReveal(); return; }
   (root||document).querySelectorAll('.reveal:not(.in)').forEach(function(el){ revealObserver.observe(el); });
 }
+
+/* ===== CLI 客户端页（1.3.5 可视化） ===== */
+var termState = {
+  ready: false,       // 折叠区 xterm 已初始化
+  ws: null,
+  connected: false,
+  connecting: false,
+  pendingCmd: '',     // 连接建立后要自动执行的命令
+  term: null,
+  fit: null,
+  enabled: null       // terminal_enabled 设置是否开启（null=未知）
+};
+var TERM_CMD = 'python mini_client.py';
+var cliLine = { buf: '', el: null };   // 输出流中未换行的"实时行"
+var CLI_ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(\x07|\x1b\\)/g;
+
+function termSetStatus(text, cls) {
+  var el = $('#termStatus');
+  if (el) { el.textContent = text; el.className = 'terminal-status' + (cls ? ' ' + cls : ''); }
+}
+
+function loadScript(src) {
+  return new Promise(function(resolve, reject) {
+    var s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = function(){ reject(new Error('加载失败: ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+
+function loadCssOnce(href) {
+  if (document.querySelector('link[href="' + href + '"]')) return Promise.resolve();
+  return new Promise(function(resolve) {
+    var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = href;
+    l.onload = resolve; l.onerror = resolve;
+    document.head.appendChild(l);
+  });
+}
+
+async function ensureXterm() {
+  if (termState.ready) return;
+  await loadCssOnce('/vendor/xterm.css');
+  await loadScript('/vendor/xterm.js');
+  await loadScript('/vendor/xterm-addon-fit.js');
+  if (!window.Terminal || !window.FitAddon) throw new Error('xterm 组件不完整');
+  var term = new window.Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
+    theme: { background: '#141a22', foreground: '#d6deeb', cursor: '#4cc2ff' },
+    scrollback: 4000
+  });
+  var fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($('#termBox'));
+  fit.fit();
+  term.onData(function(data) { termSend({ type: 'input', data: data }); });
+  term.onResize(function(sz) { termSend({ type: 'resize', rows: sz.rows, cols: sz.cols }); });
+  termState.term = term; termState.fit = fit; termState.ready = true;
+  window.addEventListener('resize', termFit);
+}
+
+function termFit() {
+  if (termState.fit && $('#view-terminal').hidden !== true) termState.fit.fit();
+}
+
+function termSend(frame) {
+  if (termState.ws && termState.ws.readyState === 1) {
+    termState.ws.send(JSON.stringify(frame));
+    return true;
+  }
+  return false;
+}
+
+function termConnect() {
+  if (termState.connecting || termState.connected) return;
+  termState.connecting = true;
+  termSetStatus('连接中…', '');
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var ws = new WebSocket(proto + '://' + location.host + '/api/terminal/ws');
+  termState.ws = ws;
+  ws.onopen = function() {
+    termState.connecting = false; termState.connected = true;
+    termSetStatus('已连接', 'ok');
+    $('#btn-term-connect').textContent = '断开';
+    if (termState.pendingCmd) {
+      termSend({ type: 'input', data: termState.pendingCmd + '\r' });
+      termState.pendingCmd = '';
+    }
+  };
+  ws.onmessage = function(ev) {
+    var frame;
+    try { frame = JSON.parse(ev.data); } catch(e) { return; }
+    if (frame.type === 'output') {
+      renderCliOutput(frame.data);
+      if (termState.term) termState.term.write(frame.data);
+    } else if (frame.type === 'exit') {
+      var exitNote = '—— 会话已结束' + (frame.reason ? '：' + frame.reason : '') + ' ——';
+      cliAppendLine(exitNote, 'cli-sys');
+      if (termState.term) termState.term.write('\r\n\x1b[33m' + exitNote + '\x1b[0m\r\n');
+      termResetConn();
+    } else if (frame.type === 'error') {
+      toast(frame.message || '命令执行错误', 'err');
+    }
+  };
+  ws.onclose = function(ev) {
+    var reason = ev.reason || '';
+    var wasConnected = termState.connected;
+    termState.connecting = false;
+    termState.pendingCmd = '';
+    if (wasConnected) {
+      var note = '—— 连接已断开' + (reason ? '：' + reason : '') + ' ——';
+      cliAppendLine(note, 'cli-sys');
+      if (termState.term) termState.term.write('\r\n\x1b[33m' + note + '\x1b[0m\r\n');
+    } else if (ev.code === 4403) {
+      toast('客户端页未启用，请在「设置」里开启后重试', 'warn');
+      termSetStatus('未启用', 'warn');
+    } else if (ev.code === 4409) {
+      toast('已有会话在其它页面运行（同一时间只允许一个）', 'warn');
+      termSetStatus('会话占用', 'warn');
+    } else if (reason) {
+      toast(reason, 'warn');
+      termSetStatus('连接失败', 'err');
+    } else if (ev.code === 1006) {
+      termSetStatus('连接失败', 'err');
+    }
+    termResetConn();
+  };
+}
+
+function termResetConn() {
+  termState.connected = false;
+  if (termState.ws) { termState.ws.onclose = null; try { termState.ws.close(); } catch(e) {} termState.ws = null; }
+  termSetStatus(termState.enabled === false ? '未启用' : '未连接', termState.enabled === false ? 'warn' : '');
+  $('#btn-term-connect').textContent = '连接';
+}
+
+function termDisconnect() {
+  if (termState.ws) { termState.ws.onclose = null; termState.ws.close(); }
+  termState.ws = null; termState.connected = false;
+  termSetStatus('未连接', '');
+  $('#btn-term-connect').textContent = '连接';
+  cliAppendLine('—— 已主动断开 ——', 'cli-sys');
+  if (termState.term) termState.term.write('\r\n\x1b[33m[已主动断开]\x1b[0m\r\n');
+}
+
+async function initTerminalView() {
+  renderRecentTopics();
+  if (termState.enabled == null) {
+    try {
+      var st = await api.get('/api/terminal/status');
+      termState.enabled = !!st.enabled;
+    } catch(e) { termState.enabled = null; }
+  }
+  if (termState.enabled === false) {
+    termSetStatus('未启用', 'warn');
+    var out = $('#cliOutput');
+    if (out) {
+      out.innerHTML = '<div class="cli-placeholder"><span>🔒</span>' +
+        '<p>客户端页未启用。<br>请到「设置」开启后重新进入本页。</p></div>';
+    }
+    return;
+  }
+  if (!termState.connected && !termState.connecting) termConnect();
+}
+
+/* ---- 可视化输出流：把终端字节流渲染成页面行 ---- */
+function cliStrip(s) { return String(s).replace(CLI_ANSI_RE, ''); }
+
+function cliClearPlaceholder(box) {
+  var ph = box.querySelector('.cli-placeholder');
+  if (ph) box.innerHTML = '';   // 连同源码缩进的空白文本节点一起清掉
+}
+
+function cliScroll(box) {
+  // 贴底时跟随滚动；用户上翻回看时不打扰
+  if (box.scrollHeight - box.scrollTop - box.clientHeight < 60) {
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
+function cliAppendLine(text, cls) {
+  var box = $('#cliOutput');
+  if (!box) return;
+  cliClearPlaceholder(box);
+  if (cliLine.el) { cliLine.el.remove(); cliLine.el = null; }
+  var div = document.createElement('div');
+  div.className = 'cli-line' + (cls ? ' ' + cls : '');
+  div.textContent = text;
+  box.appendChild(div);
+  cliScroll(box);
+}
+
+function cliFlushLine() {
+  if (!cliLine.buf) { if (cliLine.el) { cliLine.el.remove(); cliLine.el = null; } return; }
+  if (cliLine.el) {
+    cliLine.el.textContent = cliLine.buf;
+    cliLine.el.classList.remove('cli-live');
+    cliLine.el = null;
+  } else {
+    var box = $('#cliOutput');
+    if (box) {
+      cliClearPlaceholder(box);
+      var div = document.createElement('div');
+      div.className = 'cli-line';
+      div.textContent = cliLine.buf;
+      box.appendChild(div);
+    }
+  }
+  cliLine.buf = '';
+}
+
+function renderCliOutput(text) {
+  var box = $('#cliOutput');
+  if (!box) return;
+  cliClearPlaceholder(box);
+  // CRLF 归一成 LF；段内孤立的 \r 视为回行首重绘（进度条），只保留最终态
+  var parts = String(text).replace(/\r\n/g, '\n').split('\n');
+  for (var i = 0; i < parts.length; i++) {
+    var segs = parts[i].split('\r');
+    if (segs.length > 1) cliLine.buf = '';
+    cliLine.buf += cliStrip(segs[segs.length - 1]);
+    if (i < parts.length - 1) {
+      cliFlushLine();
+    } else if (cliLine.buf) {
+      // 末段：作为实时行，后续输出覆盖同一节点
+      if (!cliLine.el) {
+        cliLine.el = document.createElement('div');
+        cliLine.el.className = 'cli-line cli-live';
+        box.appendChild(cliLine.el);
+      }
+      cliLine.el.textContent = cliLine.buf;
+    }
+  }
+  cliScroll(box);
+}
+
+function cliRunCommand(cmd) {
+  if (termState.enabled === false) { toast('请先在「设置」里开启客户端页', 'warn'); return; }
+  cliAppendLine('$ ' + cmd, 'cli-cmd');
+  if (termState.connected) {
+    termSend({ type: 'input', data: cmd + '\r' });
+    return;
+  }
+  termState.pendingCmd = cmd;
+  termConnect();
+}
+
+function rememberRecentTopic(topicId, name) {
+  if (!topicId) return;
+  try {
+    var list = JSON.parse(localStorage.getItem('wcm-recent-topics') || '[]');
+    list = list.filter(function(t) { return t && t.id !== topicId; });
+    list.unshift({ id: topicId, name: name || topicId });
+    localStorage.setItem('wcm-recent-topics', JSON.stringify(list.slice(0, 8)));
+  } catch(e) {}
+}
+
+function renderRecentTopics() {
+  var box = $('#termRecentTopics');
+  if (!box) return;
+  var list = [];
+  try { list = JSON.parse(localStorage.getItem('wcm-recent-topics') || '[]'); } catch(e) {}
+  if (!list.length) {
+    box.innerHTML = '<p class="hint">还没有浏览记录。到「超话」页点开一个超话，它就会出现在这里，方便快速跳回。</p>';
+    return;
+  }
+  box.innerHTML = list.map(function(t) {
+    return '<button class="chip chip-topic" data-id="' + esc(t.id) + '" data-name="' + esc(t.name || '') + '" title="打开超话浏览">' + esc(t.name || t.id) + '</button>';
+  }).join('');
+  box.onclick = function(e) {
+    var chip = e.target.closest('.chip-topic');
+    if (!chip) return;
+    var nav = document.querySelector('.nav-item[data-view=topics]');
+    if (nav) nav.click();
+    setTimeout(function() {
+      var target = document.querySelector('.topic-list-item[data-id="' + chip.dataset.id.replace(/"/g, '') + '"]');
+      if (target) target.click();
+      else toast('超话列表还没加载完，稍后在「超话」页搜索打开', 'warn');
+    }, 700);
+  };
+}
+
+(function bindTerminalUI() {
+  // 可视化命令按钮：点击即执行
+  var actions = $('#cliActions');
+  if (actions) {
+    actions.onclick = function(e) {
+      var btn = e.target.closest('.cli-action');
+      if (!btn || !btn.dataset.cmd) return;
+      cliRunCommand(btn.dataset.cmd);
+    };
+  }
+  var connectBtn = $('#btn-term-connect');
+  if (connectBtn) connectBtn.onclick = function() {
+    if (termState.connected) termDisconnect();
+    else if (termState.enabled === false) toast('请先在「设置」里开启客户端页', 'warn');
+    else termConnect();
+  };
+  var clearBtn = $('#btn-term-clear');
+  if (clearBtn) clearBtn.onclick = function() {
+    var out = $('#cliOutput');
+    if (out) out.innerHTML = '<div class="cli-placeholder"><span>🖥️</span><p>已清空。点击上方按钮继续运行命令</p></div>';
+    cliLine.buf = ''; cliLine.el = null;
+    if (termState.term) termState.term.clear();
+  };
+  var gotoTopics = $('#btn-goto-topics');
+  if (gotoTopics) gotoTopics.onclick = function() {
+    var nav = document.querySelector('.nav-item[data-view=topics]');
+    if (nav) nav.click();
+  };
+  // 超话页 → 客户端页联动：切页并自动执行刷新命令
+  var topicTermBtn = $('#btn-topic-terminal');
+  if (topicTermBtn) topicTermBtn.onclick = function() {
+    var nav = document.querySelector('.nav-item[data-view=terminal]');
+    if (nav) nav.click();
+    cliRunCommand(TERM_CMD + ' topics refresh');
+  };
+  // 折叠的高级交互终端：展开时才加载 xterm 组件
+  var adv = $('#cliAdvanced');
+  if (adv) adv.addEventListener('toggle', function() {
+    if (!adv.open) return;
+    if (termState.ready) { termFit(); if (termState.term) termState.term.focus(); return; }
+    ensureXterm().then(function() {
+      termFit();
+      if (termState.term) termState.term.focus();
+    }).catch(function(e) {
+      toast('终端组件加载失败：' + (e.message || ''), 'err');
+    });
+  });
+})();
 
 /* ===== 初始化 ===== */
 loadVersion();

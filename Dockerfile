@@ -49,6 +49,8 @@ WORKDIR /app
 # 复制应用代码
 COPY run.py .
 COPY start.sh .
+COPY mini_client.py .
+COPY mini_accounts.example.txt .
 COPY app/ ./app/
 
 # 数据目录（数据库持久化挂载点），归属非 root 运行用户

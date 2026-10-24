@@ -17,6 +17,7 @@ from .api import accounts as accounts_api
 from .api import auth as auth_api
 from .api import proxies as proxies_api
 from .api import tasks as tasks_api
+from .api import terminal as terminal_api
 from .api import topics as topics_api
 
 logging.basicConfig(
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="微博超话签到管理面板",
     description="微博超话批量签到 · 自动调度 · TG 通知 · 防封策略",
-    version="1.3.4",
+    version="1.3.5",
     lifespan=lifespan,
 )
 
@@ -58,6 +59,7 @@ app.include_router(tasks_api.router)
 app.include_router(auth_api.router)
 app.include_router(proxies_api.router)
 app.include_router(topics_api.router)
+app.include_router(terminal_api.router)
 
 
 @app.get("/api/health")
