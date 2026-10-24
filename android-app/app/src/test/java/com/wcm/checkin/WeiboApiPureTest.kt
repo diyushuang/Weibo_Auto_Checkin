@@ -1,9 +1,9 @@
 package com.wcm.checkin
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFailsWith
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 /** WeiboApi 纯函数单元测试（不触网）：时间解析 / 摘要 / bid 解析 / cookie 与 URL 白名单。 */
@@ -77,16 +77,16 @@ class WeiboApiPureTest {
 
     @Test
     fun weiboUrl_rejectsForeignAndPrivateHosts() {
-        assertFailsWith(WeiboApi.WeiboException::class.java) {
+        assertThrows(WeiboApi.WeiboException::class.java) {
             WeiboApi.weiboUrl("https://evil.example.com/steal.jpg")
         }
-        assertFailsWith(WeiboApi.WeiboException::class.java) {
+        assertThrows(WeiboApi.WeiboException::class.java) {
             WeiboApi.weiboUrl("http://192.168.1.1/internal")
         }
-        assertFailsWith(WeiboApi.WeiboException::class.java) {
+        assertThrows(WeiboApi.WeiboException::class.java) {
             WeiboApi.weiboUrl("http://127.0.0.1:8000/")
         }
-        assertFailsWith(WeiboApi.WeiboException::class.java) {
+        assertThrows(WeiboApi.WeiboException::class.java) {
             WeiboApi.weiboUrl("ftp://m.weibo.cn/a")
         }
     }
