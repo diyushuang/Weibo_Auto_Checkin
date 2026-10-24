@@ -26,7 +26,23 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build debug APK
-        run: cd android-app && sh gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          cd android-app
+          set +e
+          sh gradlew assembleDebug --no-daemon > build.log 2>&1
+          code=$?
+          set -e
+          if [ $code -ne 0 ]; then
+            # 把编译错误转成 check 注解：无需登录也能通过 API 读到错误明细
+            grep -E "^e: |error: |FAILURE|What went wrong|Caused by" -A 2 build.log \
+              | grep -vE '^\s*$' | head -50 | sed 's/^/ /' | while IFS= read -r line; do
+                printf '::error::%s\n' "$(echo "$line" | sed 's/"/%22/g')"
+              done
+            tail -40 build.log | while IFS= read -r line; do
+              printf '::error::TAIL %s\n' "$(echo "$line" | sed 's/"/%22/g')"
+            done
+            exit $code
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
