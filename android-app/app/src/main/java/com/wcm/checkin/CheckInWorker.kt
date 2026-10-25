@@ -46,7 +46,8 @@ class CheckInWorker(context: Context, params: WorkerParameters) :
                 // 网络抖动/风控：下一轮再说
             }
         }
-        AccountStore.save(ctx, accounts)
+        // 合并式写回：整轮跑下来要几分钟，期间用户新增/删除的账号不被旧快照覆盖
+        AccountStore.mergeSave(ctx, accounts)
         return Result.success()
     }
 

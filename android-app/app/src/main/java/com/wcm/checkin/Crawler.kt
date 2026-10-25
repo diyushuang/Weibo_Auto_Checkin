@@ -229,21 +229,47 @@ object Crawler {
         return ok
     }
 
+    // ========================= 抓图身份选择（多账号回退） =========================
+
+    /**
+     * 选抓图用的 cookie：抓公开微博任一有效登录态都行，依次探活取第一个还活着的，
+     * 不再固定赌第一个账号。全部失效返回 null（原因写日志，调用方直接 return）。
+     */
+    fun pickCrawlCookie(
+        accounts: List<AccountStore.Account>,
+        log: (String) -> Unit,
+    ): String? {
+        if (accounts.isEmpty()) {
+            log("✗ 没有登录账号，先在首页添加账号")
+            return null
+        }
+        accounts.forEachIndexed { index, acc ->
+            val label = acc.name.ifEmpty { acc.uid }
+            try {
+                val v = WeiboApi.verify(acc.cookie)
+                if (v.login) {
+                    if (index > 0) log("抓图身份回退到「$label」")
+                    return v.cookie
+                }
+                log("账号「$label」登录态失效")
+            } catch (e: Exception) {
+                log("账号「$label」探活失败：${e.message}")
+            }
+        }
+        log("✗ 所有账号的登录态均已失效，先在首页重新登录任一账号")
+        return null
+    }
+
     // ========================= 单条抓取（v0.3.1） =========================
 
     /** 抓取一条微博的全部原图与 Live。幂等：同名文件跳过，不占用增量进度。 */
     suspend fun crawlSinglePost(ctx: Context, bid: String, log: (String) -> Unit) {
-        val accounts = AccountStore.load(ctx)
-        if (accounts.isEmpty()) {
-            log("✗ 没有登录账号，先在首页添加账号")
-            return
-        }
+        val cookie = pickCrawlCookie(AccountStore.load(ctx), log) ?: return
         val treeUriRaw = AccountStore.crawlTreeUri(ctx)
         if (treeUriRaw.isEmpty()) {
             log("✗ 请先选择相册目录")
             return
         }
-        val cookie = accounts.first().cookie
         val store = TreeStore(ctx.contentResolver, Uri.parse(treeUriRaw))
         store.loadExisting()
 
@@ -275,7 +301,8 @@ object Crawler {
     // ========================= 全量增量抓取 =========================
 
     /**
-     * 对全部抓取目标跑一轮增量。cookie 取第一个账号；无配置（目标/目录）时直接返回。
+     * 对全部抓取目标跑一轮增量。抓图身份见 [pickCrawlCookie]（多账号回退）；
+     * 无配置（目标/目录）时直接返回。
      * 每张图下载后回调 log；状态随帖持久化，任意时刻取消都可续跑。
      */
     suspend fun runIncremental(
@@ -294,7 +321,7 @@ object Crawler {
             if (!autoMode) log("✗ 请先添加抓取目标并选择相册目录")
             return
         }
-        val cookie = accounts.first().cookie
+        val cookie = pickCrawlCookie(accounts, log) ?: return
         val store = TreeStore(ctx.contentResolver, Uri.parse(treeUriRaw))
         store.loadExisting()
         log("相册目录已有 ${store.count()} 个文件")

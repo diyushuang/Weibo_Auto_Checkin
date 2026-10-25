@@ -32,6 +32,30 @@ object AccountStore {
 
     fun load(ctx: Context): MutableList<Account> {
         val raw = prefs(ctx).getString(KEY_ACCOUNTS, "[]") ?: "[]"
+        return deserializeAccounts(raw).toMutableList()
+    }
+
+    fun save(ctx: Context, accounts: List<Account>) {
+        prefs(ctx).edit().putString(KEY_ACCOUNTS, serializeAccounts(accounts)).apply()
+    }
+
+    // ---- 纯序列化与合并（不依赖 Android，JVM 单测覆盖） ----
+
+    fun serializeAccounts(accounts: List<Account>): String {
+        val arr = JSONArray()
+        accounts.forEach {
+            arr.put(
+                JSONObject()
+                    .put("uid", it.uid)
+                    .put("name", it.name)
+                    .put("cookie", it.cookie)
+                    .put("lastResult", it.lastResult)
+            )
+        }
+        return arr.toString()
+    }
+
+    fun deserializeAccounts(raw: String): List<Account> {
         val list = ArrayList<Account>()
         try {
             val arr = JSONArray(raw)
@@ -47,23 +71,26 @@ object AccountStore {
                 )
             }
         } catch (e: Exception) {
-            // 存储损坏时静默重置，宁可丢账号也不能让 App 起不来
+            // 存储损坏时静默降级（返回已解析的部分），宁可丢账号也不能让 App 起不来
         }
         return list
     }
 
-    fun save(ctx: Context, accounts: List<Account>) {
-        val arr = JSONArray()
-        accounts.forEach {
-            arr.put(
-                JSONObject()
-                    .put("uid", it.uid)
-                    .put("name", it.name)
-                    .put("cookie", it.cookie)
-                    .put("lastResult", it.lastResult)
-            )
+    /**
+     * 合并两个账号列表：以 current 为准（成员不增不减），只把 snapshot 里同 uid
+     * 账号的 cookie / lastResult 回填进来。运行期间用户新增 / 删除的账号不会被
+     * 旧快照覆盖（Worker 与前台签到共用，防丢新账号 / 防删掉的账号复活）。
+     */
+    fun mergeAccounts(current: List<Account>, snapshot: List<Account>): List<Account> =
+        current.map { cur ->
+            snapshot.firstOrNull { snap -> snap.uid.isNotEmpty() && snap.uid == cur.uid }
+                ?.let { snap -> cur.copy(cookie = snap.cookie, lastResult = snap.lastResult) }
+                ?: cur
         }
-        prefs(ctx).edit().putString(KEY_ACCOUNTS, arr.toString()).apply()
+
+    /** 合并式写回：先读当前库再按 [mergeAccounts] 合并，用于长任务结束时的落盘。 */
+    fun mergeSave(ctx: Context, snapshot: List<Account>) {
+        save(ctx, mergeAccounts(load(ctx), snapshot))
     }
 
     /** 按 uid upsert（同微博号换 cookie 只更新一行）。 */

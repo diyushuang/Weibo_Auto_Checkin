@@ -70,21 +70,6 @@ class HomeFragment : Fragment() {
         if (!hidden) render()
     }
 
-    /** 合并式保存：以当前库为准（运行中被删除的账号不会因快照回写而复活）。 */
-    private fun mergeAndSave(
-        ctx: android.content.Context,
-        snapshot: List<AccountStore.Account>,
-    ) {
-        val current = AccountStore.load(ctx)
-        current.forEach { cur ->
-            snapshot.find { it.uid == cur.uid }?.let { snap ->
-                cur.cookie = snap.cookie
-                cur.lastResult = snap.lastResult
-            }
-        }
-        AccountStore.save(ctx, current)
-    }
-
     // ---------- 渲染 ----------
 
     private fun render() {
@@ -191,7 +176,7 @@ class HomeFragment : Fragment() {
                     }
                 }
             } finally {
-                mergeAndSave(ctx, accounts)
+                AccountStore.mergeSave(ctx, accounts)
                 withContext(Dispatchers.Main) {
                     setBusy(false)
                     render()
@@ -445,7 +430,7 @@ class HomeFragment : Fragment() {
                     }
                 }
             } finally {
-                mergeAndSave(ctx, accounts)
+                AccountStore.mergeSave(ctx, accounts)
                 withContext(Dispatchers.Main) {
                     setBusy(false)
                     render()

@@ -185,8 +185,8 @@ class GalleryFragment : Fragment() {
                         log("✗ 无法解析 UID：$input")
                         return@launch
                     }
-                    val cookie = AccountStore.load(ctx).firstOrNull()?.cookie ?: ""
-                    val name = if (cookie.isEmpty()) "" else WeiboApi.fetchUserName(cookie, uid)
+                    val cookie = Crawler.pickCrawlCookie(AccountStore.load(ctx), ::log)
+                    val name = if (cookie.isNullOrEmpty()) "" else WeiboApi.fetchUserName(cookie, uid)
                     AccountStore.addCrawlTarget(ctx, AccountStore.CrawlTarget(uid, name))
                     withContext(Dispatchers.Main) { renderTargets() }
                     log("✓ 已添加：${name.ifEmpty { uid }}（$uid）")
@@ -278,11 +278,8 @@ class GalleryFragment : Fragment() {
                         log("✗ 无法识别输入：$input")
                         return@launch
                     }
-                    val cookie = AccountStore.load(ctx).firstOrNull()?.cookie
-                    if (cookie.isNullOrEmpty()) {
-                        log("✗ 没有登录账号，先在首页添加账号")
-                        return@launch
-                    }
+                    val cookie = Crawler.pickCrawlCookie(AccountStore.load(ctx), ::log)
+                        ?: return@launch
                     log("正在拉取博主 $uid 的最近微博…")
                     val posts = ArrayList<WeiboApi.RawPost>()
                     for (page in 1..2) {

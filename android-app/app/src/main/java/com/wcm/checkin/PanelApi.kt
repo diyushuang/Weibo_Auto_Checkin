@@ -31,6 +31,13 @@ object PanelApi {
             .build()
         WeiboApi.client.newCall(request).execute().use { resp ->
             val text = resp.body?.string() ?: "{}"
+            if (resp.code == 429) {
+                // 面板限流（多账号连续同步叠加保活时会触顶）：明确提示而非笼统的 HTTP 429
+                val retry = resp.header("Retry-After")?.toIntOrNull()
+                val detail = "同步频率超限" +
+                    (if (retry != null && retry > 0) "，$retry 秒后可重试" else "（面板限流）")
+                return SyncResult(false, false, "", "rate_limited", detail)
+            }
             if (resp.code == 409) {
                 // 面板拒绝覆盖（探活失败/账号健康）：提示去 App 重新登录
                 val detail = try {

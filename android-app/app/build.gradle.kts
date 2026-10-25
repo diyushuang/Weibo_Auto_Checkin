@@ -11,8 +11,8 @@ android {
         applicationId = "com.wcm.checkin"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.4.0"
+        versionCode = 7
+        versionName = "0.4.1"
     }
 
     buildTypes {
@@ -42,4 +42,6 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     testImplementation("junit:junit:4.13.2")
+    // 本地单测跑在 JVM，android.jar 里的 org.json 是抛 Stub! 的桩，换真实实现
+    testImplementation("org.json:json:20240303")
 }

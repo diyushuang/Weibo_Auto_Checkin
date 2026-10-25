@@ -31,18 +31,24 @@ class LoginWebViewActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         statusView = findViewById(R.id.loginStatus)
 
-        val cm = CookieManager.getInstance()
-        // 每次进入都是干净会话：添加第二个账号时不继承第一个的登录
-        cm.setAcceptCookie(true)
-        cm.setAcceptThirdPartyCookies(webView, true)
-        cm.removeAllCookies(null)
-
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
         }
         webView.webViewClient = android.webkit.WebViewClient()
 
+        val cm = CookieManager.getInstance()
+        // 每次进入都是干净会话：添加第二个账号时不继承第一个的登录。
+        // 清库是异步的，等回调确认清完再加载页面，避免轮询读到残留 cookie 误判已登录。
+        cm.setAcceptCookie(true)
+        cm.setAcceptThirdPartyCookies(webView, true)
+        cm.removeAllCookies {
+            runOnUiThread { startLoginFlow() }
+        }
+    }
+
+    private fun startLoginFlow() {
+        if (isFinishing || isDestroyed) return
         // 与面板扫码登录同源的 wapsso 入口，成功后 302 回 m.weibo.cn
         webView.loadUrl(
             "https://passport.weibo.com/sso/signin?entry=wapsso&source=wapsso" +
