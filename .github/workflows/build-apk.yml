@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Decode signing keystore
+        env:
+          WCM_KEYSTORE_B64: ${{ secrets.WCM_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$WCM_KEYSTORE_B64" ]; then
+            echo '::warning::未配置 Secret WCM_KEYSTORE_B64：本次 APK 用一次性随机 debug 密钥签名，覆盖安装旧版会报「签名冲突」。配置方法见 README「APK 签名」。'
+            exit 0
+          fi
+          mkdir -p android-app/app/keystore
+          printf '%s' "$WCM_KEYSTORE_B64" | base64 -d > android-app/app/keystore/wcm-release.p12
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:

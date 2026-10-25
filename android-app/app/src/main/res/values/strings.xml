@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">微博签到</string>
+    <string name="app_name">微博签到助手</string>
 
     <!-- 底部导航 -->
     <string name="nav_home">首页</string>
@@ -64,7 +64,7 @@
     <string name="settings_behavior_title">行为</string>
     <string name="settings_live_gif">Live Photo 转 GIF（关闭则保存原始视频）</string>
     <string name="settings_about_title">关于</string>
-    <string name="settings_about_body">微博签到 App v%1$s\n真机签到 · 登录态同步 · 原图抓取 · 图库预览\n权限：仅 INTERNET</string>
+    <string name="settings_about_body">微博签到助手 v%1$s\n真机签到 · 登录态同步 · 原图抓取 · 图库预览\n权限：仅 INTERNET</string>
 
     <!-- 图库（v0.4.0） -->
     <string name="gallery_card_title">图库预览</string>

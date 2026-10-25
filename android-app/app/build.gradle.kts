@@ -3,6 +3,12 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 稳定签名 keystore（PKCS12，别名 wcmsign）：本地放 app/keystore/（已 gitignore），
+// CI 由 Secret WCM_KEYSTORE_B64 解出到同一路径。Android 只允许同签名 APK 覆盖安装，
+// 缺失该文件时回退默认 debug 密钥，覆盖旧版会报「签名冲突」。
+val wcmKeystore = file("keystore/wcm-release.p12").takeIf { it.exists() }
+val wcmStorePassword = System.getenv("WCM_KEYSTORE_PASSWORD") ?: "wcm-checkin"
+
 android {
     namespace = "com.wcm.checkin"
     compileSdk = 35
@@ -11,13 +17,29 @@ android {
         applicationId = "com.wcm.checkin"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.4.1"
+        versionCode = 8
+        versionName = "0.4.2"
+    }
+
+    signingConfigs {
+        if (wcmKeystore != null) {
+            create("wcm") {
+                storeFile = wcmKeystore
+                storeType = "PKCS12"
+                storePassword = wcmStorePassword
+                keyAlias = "wcmsign"
+                keyPassword = wcmStorePassword
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfigs.findByName("wcm")?.let { signingConfig = it }
+        }
         release {
             isMinifyEnabled = false
+            signingConfigs.findByName("wcm")?.let { signingConfig = it }
         }
     }
     compileOptions {

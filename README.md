@@ -235,6 +235,24 @@ App 工程在 `android-app/`（Kotlin，仅 `INTERNET` 权限），APK 由 GitHu
 自动构建（`.github/workflows/build-apk.yml`，Actions 页面下载 `wcm-app-debug`
 产物）；也可以用 Android Studio 直接打开构建。
 
+### 📦 APK 签名（覆盖安装升级的前提）
+
+Android 只允许签名一致的 APK 覆盖安装，否则报「软件包与现有软件包存在冲突 /
+开发者签名异常」。CI 每次都是全新 runner，默认 debug 密钥是随机生成的，因此
+统一改用固定 keystore 签名：
+
+1. 密钥已生成在 `android-app/app/keystore/wcm-release.p12`（PKCS12，别名
+   `wcmsign`，口令 `wcm-checkin`，整个目录已 gitignore）。**请备份到仓库之外**
+   ——丢失后新版本将无法再覆盖升级。
+2. 仓库 → Settings → Secrets and variables → Actions → New repository secret：
+   新建 `WCM_KEYSTORE_B64`，值为同目录 `wcm-release.p12.b64` 的内容（即
+   keystore 的 base64）。配置后 CI 构建的 APK 全部同签名，可直接覆盖升级；
+   未配置时仍会构建并给出 warning，但签名退回一次性随机 debug 密钥。
+3. 首次启用前旧版 App 需**卸载一次**再装新 APK（签名不同无法覆盖；卸载会清掉
+   App 本地保存的账号 Cookie，需重新登录），此后每次更新直接覆盖安装即可。
+4. 本地 Android Studio 构建：把 `wcm-release.p12` 放回 `app/keystore/` 下，
+   即与 CI 产物同签名。
+
 ## 🎯 使用
 
 1. 初始化/登录面板
