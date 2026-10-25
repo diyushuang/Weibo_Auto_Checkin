@@ -19,26 +19,43 @@ COOKIE_NAME = "wcm_token"
 SESSION_TTL_HOURS = 168  # 7 天
 
 
-# ========================= 密码哈希（PBKDF2） =========================
+# ========================= 密码哈希（PBKDF2，v1.3.8 升 600k 迭代） =========================
+
+# OWASP 2023 建议 PBKDF2-SHA256 ≥600,000 迭代；老库存量哈希是 120k，
+# 校验兼容旧格式（salt$hash），下次改密自然升级到新格式。
+_PBKDF2_ITERATIONS = 600_000
+_PBKDF2_LEGACY_ITERATIONS = 120_000
+
 
 def hash_password(password: str, salt: str | None = None) -> str:
-    """返回 'salt$hash' 格式的 PBKDF2-SHA256 哈希。"""
+    """返回 'pbkdf2$iterations$salt$hash' 格式（可自描述迭代次数）。"""
     salt = salt or secrets.token_hex(16)
     dk = hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt.encode(), iterations=120_000
+        "sha256", password.encode(), salt.encode(), iterations=_PBKDF2_ITERATIONS
     )
-    return f"{salt}${dk.hex()}"
+    return f"pbkdf2${_PBKDF2_ITERATIONS}${salt}${dk.hex()}"
 
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        salt, expected = stored.split("$", 1)
-    except ValueError:
+        parts = stored.split("$")
+        if len(parts) == 4 and parts[0] == "pbkdf2":
+            _, iterations_raw, salt, expected = parts
+            iterations = int(iterations_raw)
+            if iterations <= 0:
+                return False
+        elif len(parts) == 2:
+            # 旧格式 salt$hash（120k 迭代），校验通过即兼容
+            salt, expected = parts
+            iterations = _PBKDF2_LEGACY_ITERATIONS
+        else:
+            return False
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt.encode(), iterations=iterations
+        )
+        return hmac.compare_digest(dk.hex(), expected)
+    except (ValueError, TypeError):
         return False
-    dk = hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt.encode(), iterations=120_000
-    )
-    return hmac.compare_digest(dk.hex(), expected)
 
 
 # ========================= 默认管理员 =========================

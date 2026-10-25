@@ -161,3 +161,30 @@ def test_init_rejected_when_users_exist(client):
     """已有用户时不能重复 init。"""
     r = client.post("/api/auth/init", json={"username": "x", "password": "12345678"})
     assert r.status_code == 400
+
+
+# ---------- PBKDF2 版本化（v1.3.8：600k 迭代 + 旧格式兼容） ----------
+
+def test_password_hash_new_format_600k():
+    h = auth.hash_password("pw123456")
+    parts = h.split("$")
+    assert parts[0] == "pbkdf2"
+    assert parts[1] == "600000"          # OWASP 2023 推荐迭代数
+    assert auth.verify_password("pw123456", h)
+    assert not auth.verify_password("wrong", h)
+
+
+def test_password_verify_legacy_120k_format():
+    """v1.3.7 前的 'salt$hash'（120k 迭代）存量哈希仍可校验登录。"""
+    import hashlib
+    salt = "0123abcd"
+    dk = hashlib.pbkdf2_hmac("sha256", b"legacy-pw", salt.encode(), iterations=120_000)
+    legacy = f"{salt}${dk.hex()}"
+    assert auth.verify_password("legacy-pw", legacy)
+    assert not auth.verify_password("wrong", legacy)
+
+
+def test_password_verify_malformed_hashes():
+    assert not auth.verify_password("x", "garbage")
+    assert not auth.verify_password("x", "pbkdf2$abc$salt$zz")   # 迭代数非法
+    assert not auth.verify_password("x", "")

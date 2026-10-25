@@ -15,7 +15,9 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-from .security import safe_exc, validate_weibo_url
+from .security import (
+    WEIBO_HOSTS, guarded_request, safe_exc, validate_weibo_url,
+)
 
 log = logging.getLogger("weibo.client")
 
@@ -736,12 +738,26 @@ def request_via_proxy(session, method, url, channel="auto", proxy=None,
 
 
 def request_json(session, method, url, channel="auto", proxy=None,
-                 force=False, allow_fallback=True, **kwargs):
-    response = request_via_proxy(
-        session, method, url, channel=channel, proxy=proxy,
-        force=force, allow_fallback=allow_fallback,
-        timeout=kwargs.pop("timeout", 15), **kwargs,
-    )
+                 force=False, allow_fallback=True, url_guard_hosts=None,
+                 **kwargs):
+    """url_guard_hosts：初始 URL 及每个重定向目标都限定在该 host 后缀白名单内
+    （checkin_topic 的 scheme 来自微博响应，30x 目标不可信，必须逐跳校验）。"""
+    if url_guard_hosts is not None:
+        response = guarded_request(
+            session, method, url,
+            allowed_hosts=url_guard_hosts,
+            sender=lambda m, u, **kw: request_via_proxy(
+                session, m, u, channel=channel, proxy=proxy,
+                force=force, allow_fallback=allow_fallback, **kw,
+            ),
+            timeout=kwargs.pop("timeout", 15), **kwargs,
+        )
+    else:
+        response = request_via_proxy(
+            session, method, url, channel=channel, proxy=proxy,
+            force=force, allow_fallback=allow_fallback,
+            timeout=kwargs.pop("timeout", 15), **kwargs,
+        )
     response.raise_for_status()
     try:
         return response.json()
@@ -972,12 +988,14 @@ def checkin_topic(session, cookies, scheme, st, channel="auto", proxy=None,
         raise RuntimeError("缺少签到链接 scheme")
     url = scheme if scheme.startswith("http") else BASE + scheme
     # scheme 来自微博接口响应，属不可信输入：绝对 URL 只允许微博自家 host，
-    # 并拒绝私有/保留地址，防止账号 Cookie 被发往任意外部主机。
+    # 并拒绝私有/保留地址，防止账号 Cookie 被发往任意外部主机；
+    # 重定向目标同样不可信，逐跳走同一套守卫（url_guard_hosts）。
     url = validate_weibo_url(url)
     separator = "&" if "?" in url else "?"
     return request_json(
         session, "GET", f"{url}{separator}st={st}", cookies=cookies,
         channel=channel, proxy=proxy, force=force, allow_fallback=allow_fallback,
+        url_guard_hosts=WEIBO_HOSTS,
     )
 
 

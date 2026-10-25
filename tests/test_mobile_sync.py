@@ -29,7 +29,7 @@ def client(tmp_path, monkeypatch):
         "mobile_sync_token": TOKEN,
     })
     auth_mod.reset_login_limits()
-    mobile_api._rate_stats.clear()
+    mobile_api.reset_rate_limits()
 
     from fastapi.testclient import TestClient
     with TestClient(app) as c:

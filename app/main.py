@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="微博超话签到管理面板",
     description="微博超话批量签到 · 自动调度 · TG 通知 · 防封策略",
-    version="1.3.7",
+    version="1.3.8",
     lifespan=lifespan,
 )
 
@@ -67,10 +67,16 @@ app.include_router(mobile_api.router)
 
 
 @app.get("/api/health")
-def health():
+def health(request: Request):
     # 注意：这里的 ok 只代表"进程活着"，不代表登录态健康。
     # cookie 全死也必须返回 ok=True —— Dockerfile 的 HEALTHCHECK 只看 HTTP 状态，
     # 若因业务故障返回失败，配合 restart policy 会引发容器重启风暴。
+    # 匿名访问只回存活标记：auth_enabled / 账号健康统计 / 版本号属于侦察面信息，
+    # 公开返回等于替攻击者画部署画像（v1.3.8 收窄）。
+    token = request.cookies.get(auth.COOKIE_NAME, "")
+    user = database.get_session_user(token) if token else None
+    if not user and auth.auth_enabled():
+        return {"ok": True}
     try:
         cookie_stats = database.count_cookie_health()
     except Exception:

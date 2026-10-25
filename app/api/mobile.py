@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import logging
 import secrets
-import threading
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -40,38 +38,22 @@ _LOCK_SECONDS = 900
 _OK_WINDOW_SECONDS = 3600
 _OK_MAX = 30
 
-_rate_guard = threading.Lock()
-_rate_stats: dict[str, dict] = {}
-
-
-def _prune(hits: list[float], window: float) -> list[float]:
-    now = time.time()
-    return [t for t in hits if now - t < window]
-
 
 def _check_and_count(ip: str, *, ok: bool) -> float:
-    """记录一次同步尝试；返回剩余锁定秒数（0 = 未锁定）。调用方持锁语义由内部保证。"""
-    with _rate_guard:
-        stat = _rate_stats.setdefault(ip, {"fails": [], "ok": [], "locked_until": 0.0})
-        now = time.time()
-        if stat["locked_until"] > now:
-            return stat["locked_until"] - now
-        if ok:
-            stat["ok"] = _prune(stat["ok"], _OK_WINDOW_SECONDS)
-            if len(stat["ok"]) >= _OK_MAX:
-                # 不锁，只拒绝：成功的同步不该被惩罚，只是别刷太勤
-                stat["ok"].append(now)
-                return -1.0  # -1 表示"频率超限"而非"锁定"
-            stat["ok"].append(now)
-            stat["fails"] = _prune(stat["fails"], _FAIL_WINDOW_SECONDS)
-            return 0.0
-        stat["fails"].append(now)
-        stat["fails"] = _prune(stat["fails"], _FAIL_WINDOW_SECONDS)
-        if len(stat["fails"]) >= _FAIL_MAX:
-            stat["locked_until"] = now + _LOCK_SECONDS
-            stat["fails"] = []
-            return _LOCK_SECONDS
-        return 0.0
+    """记录一次同步尝试；返回剩余锁定秒数（0=放行，-1=成功频率超限）。
+    v1.3.8：状态落 SQLite（与登录限流同口径），重启不丢、跨进程共享、条目封顶，
+    反代透传伪造 XFF 也无法把限流字典撑爆。"""
+    return database.mobile_rate_check_and_count(
+        ip, ok,
+        fail_window=_FAIL_WINDOW_SECONDS, fail_max=_FAIL_MAX,
+        lock_seconds=_LOCK_SECONDS,
+        ok_window=_OK_WINDOW_SECONDS, ok_max=_OK_MAX,
+    )
+
+
+def reset_rate_limits() -> None:
+    """清空全部手机同步限流状态（测试用）。"""
+    database.reset_mobile_rate_limits()
 
 
 class MobileSync(BaseModel):

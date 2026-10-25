@@ -160,7 +160,75 @@
 
 - 敏感凭据（微博 Cookie、代理账密）仍是明文落库；可考虑应用层加密
   （密钥放环境变量/密钥文件）。当前依赖文件系统权限 + 静态挂载收窄防护。
-- PBKDF2 迭代次数 120,000 可随硬件提升（OWASP 2023 建议 600,000）。
 - 登录限流按 IP；如需抗分布式爆破可叠加按账号维度限流。
 - 前端 CSP 若后续重构掉内联事件，可移除 `unsafe-inline`。
 - `tests/frontend-render.test.js`（jsdom）建议纳入 CI。
+
+---
+
+# 安全审计报告 · 第二轮（v1.3.8，2026-10-25）
+
+> 审计方式：Mimosa 密封深度扫描（scan-2026-10-25T08-06-51.057Z-a753fb16c556，
+> seal sha256:6c686ed1…7116，10 项静态发现）+ 全路由授权矩阵 / 前端 XSS /
+> 部署链人工复核。扫描器 10 项发现（database.py DDL f-string、hitokoto 常量
+> URL、6 处防封节拍 random）经逐条复核均为上下文误报，证据见提交记录。
+> 以下为人工复核确认的真实问题与修复（已全部修复，测试 235 项通过）。
+
+## H-A 出站 SSRF 守卫不覆盖 HTTP 重定向（中低，已修复）
+
+- **位置**：`app/security.py`（原 `validate_outbound_url` 只校验初始 URL）
+- **问题**：requests 默认跟随重定向且不校验目标。微博白名单域上一个 30x
+  （或被攻破的微博响应）可把图床探测 / 头像下载 / 签到请求（连带域匹配 Cookie）
+  导引至 `169.254.169.254` 云元数据或内网地址，架空整套出站守卫。
+- **修复**：新增 `security.guarded_request()`——关闭自动重定向，每个 30x 的
+  Location 解析为绝对地址后重新过 `validate_outbound_url`（含 host 白名单与
+  私网/保留段拦截），8 跳上限防循环。接入全部 5 个不可信 URL 出口：
+  `checkin_topic`（经 `request_json(url_guard_hosts=…)`）、`/api/topics/img`
+  图床下载、`_cache_weibo_avatar` 头像、扫码回调 crossDomain 列表、扫码
+  登录跳转 URL。
+- **残余（记录）**：校验时解析 DNS、请求时 requests 再次独立解析，存在理论
+  重绑定窗口；逐跳"发送前一刻校验"已把窗口压到 check-then-use 最小形态，
+  不做 IP 锁定（会破坏 TLS SNI 与代理链路）。代码常量 URL（m.weibo.cn API
+  等）的重定向不在守卫范围（沿用第五节"URL 来源不在代码常量里才校验"的
+  设计边界）。
+
+## M-A `/api/health` 匿名信息泄露（低，已修复）
+
+- **问题**：公开返回 `auth_enabled`（告知攻击者是否需登录）、Cookie 健康统计、
+  版本号，等于替攻击者画部署画像。
+- **修复**：匿名访问只回 `{"ok": true}`（Docker HEALTHCHECK 只看状态码，不受
+  影响）；带有效会话返回全量。前端健康按钮在已登录页面上，功能不变。
+
+## M-B 手机同步限流状态仅在进程内存（低，已修复）
+
+- **问题**：`_rate_stats` 字典重启清零、多进程不共享；反代透传伪造 XFF 时
+  条目无界增长（内存放大）。
+- **修复**：限流状态落 SQLite（新表 `mobile_sync_rate`，与 `login_locks` 同套
+  写锁口径），重启/多进程共享；表条目封顶 4096（`MOBILE_RATE_MAX_IPS`），
+  超限按最旧淘汰。语义与原实现一致（10 失败/15 分钟 → 锁 15 分钟；
+  成功 30 次/小时只拒绝不锁）。
+
+## L-A PBKDF2 迭代次数偏低（已修复，格式版本化）
+
+- **问题**：存量 120,000 迭代低于 OWASP 2023 建议的 600,000。
+- **修复**：新哈希格式 `pbkdf2$iterations$salt$hash` 自描述迭代数（600k）；
+  校验兼容旧格式 `salt$hash`（按 120k），存量管理员无需重置密码，
+  下次改密自然升级。
+
+## L-B 依赖声明无上界（已修复）
+
+- `requirements.txt` 全部依赖补主版本上界（`<1`/`<3` 等），配合既有
+  `PIP_ONLY_BINARY=:all:` 护栏，降低未来大版本破坏与供应链突变面。
+
+## L-C 测试脚本 execSync 字符串拼接（已修复）
+
+- `tests/frontend-render.test.js` 的 jsdom 自动安装改 `execFileSync` 参数
+  数组形式（路径来自 mkdtemp，本无注入，消除模式告警）。
+
+## 本轮确认无误的面（未改动）
+
+- 全部 37 条 API 路由 `require_admin`；终端 WS 自行鉴权、无匿名降级、
+  单会话 + 30 分钟空闲断开；令牌生成均用 `secrets`；`update_proxy` /
+  `set_cookie_state` 动态 SET 子句键名取自硬编码白名单；头像/图片缓存
+  文件名消毒（正则白名单 / URL 哈希）；前端 `esc()` 纪律完整（含
+  `linkifyText` 预转义、AI 输出受限 markdown）；git 无敏感文件入库。

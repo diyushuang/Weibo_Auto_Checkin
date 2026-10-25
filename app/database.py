@@ -210,6 +210,15 @@ def init_db() -> None:
             locked_until REAL NOT NULL DEFAULT 0     -- 锁定截止时间戳（秒）
         );
 
+        -- 手机同步令牌限流（v1.3.8：原进程内存字典可被伪造 XFF 撑爆，且重启清零；
+        -- 与 login_locks 同一套持久化口径）
+        CREATE TABLE IF NOT EXISTS mobile_sync_rate (
+            ip           TEXT PRIMARY KEY,
+            fails        TEXT NOT NULL DEFAULT '[]',  -- JSON：窗口内令牌错误时间戳
+            oks          TEXT NOT NULL DEFAULT '[]',  -- JSON：窗口内成功同步时间戳
+            locked_until REAL NOT NULL DEFAULT 0
+        );
+
         """
     )
     conn.commit()
@@ -1229,6 +1238,82 @@ def reset_all_login_locks() -> None:
     """清空全部登录限流状态（测试与运维用途）。"""
     conn = _get_conn()
     conn.execute("DELETE FROM login_locks")
+    conn.commit()
+
+
+# ========================= 手机同步限流（v1.3.8：持久化 + 条目封顶） =========================
+
+# 表条目上限：反代透传伪造 XFF 时攻击者可以制造海量伪 IP，封顶后按最旧淘汰，
+# 内存与库体积都不会无界增长
+MOBILE_RATE_MAX_IPS = 4096
+
+
+def _load_stamps(raw, window: float, now: float) -> list[float]:
+    try:
+        return [t for t in json.loads(raw or "[]") if now - t < window]
+    except (TypeError, ValueError):
+        return []
+
+
+def mobile_rate_check_and_count(
+    ip: str, ok: bool, *, fail_window: float, fail_max: int,
+    lock_seconds: float, ok_window: float, ok_max: int,
+) -> float:
+    """记录一次手机同步尝试；返回剩余锁定秒数（0=放行，-1=成功频率超限）。"""
+    import time
+
+    if not ip:
+        return 0.0
+    conn = _get_conn()
+    with _write_lock:
+        now = time.time()
+        row = conn.execute(
+            "SELECT fails, oks, locked_until FROM mobile_sync_rate WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+        fails = _load_stamps(row["fails"], fail_window, now) if row else []
+        oks = _load_stamps(row["oks"], ok_window, now) if row else []
+        locked_until = float(row["locked_until"] or 0) if row else 0.0
+        if locked_until > now:
+            return locked_until - now
+
+        if ok:
+            oks.append(now)
+            over_rate = len(oks) > ok_max
+        else:
+            fails.append(now)
+            over_rate = False
+        if not ok and len(fails) >= fail_max:
+            locked_until = now + lock_seconds
+            fails = []
+
+        conn.execute(
+            "INSERT INTO mobile_sync_rate (ip, fails, oks, locked_until) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(ip) DO UPDATE SET fails = ?, oks = ?, locked_until = ?",
+            (ip, json.dumps(fails), json.dumps(oks), locked_until,
+             json.dumps(fails), json.dumps(oks), locked_until),
+        )
+        # 条目封顶：先清完全过期的行，仍超则按锁定时间/写入顺序淘汰最旧
+        count = conn.execute("SELECT COUNT(*) FROM mobile_sync_rate").fetchone()[0]
+        if count > MOBILE_RATE_MAX_IPS:
+            conn.execute(
+                "DELETE FROM mobile_sync_rate WHERE ip IN ("
+                "  SELECT ip FROM mobile_sync_rate"
+                "  ORDER BY locked_until ASC, rowid ASC LIMIT ?)",
+                (count - MOBILE_RATE_MAX_IPS,),
+            )
+        conn.commit()
+
+        if locked_until > now:
+            return locked_until - now
+        return -1.0 if over_rate else 0.0
+
+
+def reset_mobile_rate_limits() -> None:
+    """清空全部手机同步限流状态（测试与运维用途）。"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM mobile_sync_rate")
     conn.commit()
 
 

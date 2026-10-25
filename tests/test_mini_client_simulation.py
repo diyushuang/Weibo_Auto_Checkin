@@ -178,6 +178,10 @@ def sim(tmp_path, monkeypatch):
     monkeypatch.setattr(wc, "CONFIG_URL", base + "/api/config")
     monkeypatch.setattr(wc, "TOPICS_URL", base + "/api/container/getIndex")
     monkeypatch.setattr(wc, "validate_weibo_url", lambda url, *a, **k: url)
+    # 模拟服务器在 127.0.0.1：逐跳出站守卫同样要放行本地回环（仅测试）
+    from app import security as sec
+    monkeypatch.setattr(sec, "validate_outbound_url",
+                        lambda url, allowed_hosts=(): url)
 
     db = tmp_path / "sim.db"
     monkeypatch.setattr(database, "DB_PATH", db)

@@ -1,7 +1,7 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
 apscheduler>=3.10,<4
-requests>=2.32
-PySocks>=1.7.1
-pydantic>=2.6
-python-multipart>=0.0.9
+requests>=2.32,<3
+PySocks>=1.7.1,<2
+pydantic>=2.6,<3
+python-multipart>=0.0.9,<1

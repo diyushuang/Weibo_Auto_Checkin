@@ -3,7 +3,7 @@
    若 jsdom 未安装，会自动装到本地临时目录（不污染项目）。 */
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const os = require('os');
 
 let jsdom;
@@ -13,7 +13,8 @@ try {
   // 自动安装 jsdom 到临时目录并用 NODE_PATH 解析
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jsdom-'));
   console.log('⏳ 正在临时安装 jsdom…');
-  execSync('npm install jsdom --prefix ' + tmp, { stdio: 'inherit' });
+  // 参数数组形式的 execFileSync：路径来自 mkdtemp，不经 shell，无注入面
+  execFileSync('npm', ['install', 'jsdom', '--prefix', tmp], { stdio: 'inherit' });
   process.env.NODE_PATH = path.join(tmp, 'node_modules');
   delete require.cache[require.resolve('module')];
   require('module').Module._initPaths();

@@ -157,10 +157,11 @@ _IMG_CACHE_EXTS = (".jpg", ".png", ".webp", ".gif", ".bmp")
 
 
 def _fetch_image_bytes(url: str) -> bytes | None:
-    """依次用多组请求头下载；403/429 切换下一组，其他错误直接放弃。"""
+    """依次用多组请求头下载；403/429 切换下一组，其他错误直接放弃。
+    URL 来自微博接口响应：每跳（含重定向目标）都过出站守卫，拒绝私网导流。"""
     for headers in _IMG_HEADER_STRATEGIES:
         try:
-            resp = requests.get(url, timeout=15, headers=headers)
+            resp = security.guarded_request(requests, "GET", url, timeout=15, headers=headers)
         except Exception as exc:
             log.warning("图片下载失败 %s: %s", url[:80], safe_exc(exc))
             return None

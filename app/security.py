@@ -18,7 +18,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from urllib.parse import urlunparse, urlparse
+from urllib.parse import urljoin, urlunparse, urlparse
 
 MAX_MESSAGE_LEN = 500
 
@@ -151,3 +151,59 @@ def validate_weibo_url(url: str) -> str:
 def validate_weibo_login_url(url: str) -> str:
     """扫码登录链路的出站校验：微博自家域 + 新浪通行域，拒绝其余 host 与私网地址。"""
     return validate_outbound_url(url, allowed_hosts=WEIBO_LOGIN_HOSTS)
+
+
+# ========================= 逐跳受控请求 =========================
+
+# requests 自动重定向不校验目标：白名单域上一个 30x 就能把请求（连带 Cookie jar
+# 里域匹配的凭据）导去内网/云元数据地址，架空上面的出站守卫。凡初始 URL 来自
+# 不可信输入（微博接口返回的 scheme / 头像地址 / 扫码回调），一律改走本函数：
+# 关闭自动重定向，每个 30x 的 Location 解析成绝对地址后重新过 validate_outbound_url，
+# 通过才跟随；不通过立即中止并抛 UnsafeURLError。
+#
+# 残余限制（记录于 SECURITY_AUDIT.md）：校验时解析 DNS、请求时 requests 会再次
+# 独立解析，理论上存在重绑定窗口；本函数把校验收紧到"每跳发送前一刻"，已将
+# 窗口压到 check-then-use 的最小形态，不做 IP 锁定（会破坏 TLS SNI 与代理链路）。
+_MAX_REDIRECT_HOPS = 8
+
+
+def guarded_request(session, method: str, url: str, *,
+                    allowed_hosts: tuple[str, ...] = (),
+                    sender=None, **kwargs):
+    """带逐跳出站校验的 HTTP 请求（默认 GET 场景）。
+
+    - session / sender：sender 缺省用 session.request；也可注入自定义传输
+      （如带代理回退的 request_via_proxy），签名 (method, url, **kwargs)。
+    - kwargs 原样传给每一跳（timeout / headers / cookies 等）；
+      allow_redirects 由本函数强制关闭，不接受外部覆盖。
+    - 返回最终 Response（非重定向状态）；重定向目标任一跳不合法、
+      或超过 8 跳，抛 UnsafeURLError。
+    """
+    kwargs = dict(kwargs)
+    kwargs["allow_redirects"] = False
+    if sender is not None:
+        send = sender
+    elif hasattr(session, "request"):
+        send = session.request
+    else:
+        # 兼容只实现 get 的鸭子类型会话对象（测试替身）；守卫出口当前全是 GET
+        def send(method, url, _get=session.get, **kw):
+            return _get(url, **kw)
+    url = validate_outbound_url(url, allowed_hosts=allowed_hosts)
+    response = None
+    for _ in range(_MAX_REDIRECT_HOPS):
+        response = send(method, url, **kwargs)
+        if not getattr(response, "is_redirect", False):
+            return response
+        location = response.headers.get("Location", "")
+        response.close()
+        if not location:
+            return response
+        next_url = urljoin(url, location)
+        try:
+            next_url = validate_outbound_url(next_url, allowed_hosts=allowed_hosts)
+        except UnsafeURLError as exc:
+            raise UnsafeURLError(f"重定向目标被拒绝：{exc}") from exc
+        url = next_url
+    response.close()
+    raise UnsafeURLError(f"重定向超过 {_MAX_REDIRECT_HOPS} 跳，疑似循环，已中止")

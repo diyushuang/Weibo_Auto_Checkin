@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field
 
 from .. import accounts_service, auth, database
 from .. import __version__
-from ..security import safe_exc, validate_outbound_url, validate_weibo_login_url
+from ..security import (
+    WEIBO_LOGIN_HOSTS, guarded_request, safe_exc, validate_outbound_url,
+    validate_weibo_login_url,
+)
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -290,9 +293,13 @@ def _complete_qr_login(session: requests.Session, item: dict, payload: dict) -> 
                         urlparse(u or "").hostname or "?")
             continue
         try:
-            session.get(u, timeout=15, allow_redirects=True)
+            # 回调 URL 与其重定向目标都来自微博响应：逐跳限定微博/新浪登录域
+            guarded_request(session, "GET", u, timeout=15,
+                            allowed_hosts=WEIBO_LOGIN_HOSTS)
         except requests.RequestException as exc:
             log.warning("回调 %s 异常：%s", u, safe_exc(exc))
+        except ValueError as exc:
+            log.warning("回调重定向被拒 %s：%s", u, safe_exc(exc))
     # 兜底：触发 m.weibo.cn 跨域写 cookie（SSOLoginState/WEIBOCN_FROM/MLOGIN 等）
     try:
         session.get("https://m.weibo.cn/api/config", timeout=10, allow_redirects=True)
@@ -398,8 +405,10 @@ def get_qr_login_status(session_id: str, user: dict = Depends(auth.require_admin
     login_url = data.get("url") or data.get("alt") or item.get("alt")
     if login_url:
         try:
-            # 登录跳转 URL 来自微博响应，限定微博/新浪登录域（跨域同步可落 login.sina.com.cn）
-            session.get(validate_weibo_login_url(login_url), timeout=15, allow_redirects=True)
+            # 登录跳转 URL 来自微博响应，限定微博/新浪登录域（跨域同步可落 login.sina.com.cn）；
+            # 30x 目标逐跳同口径校验，防止借重定向导流出微博域
+            guarded_request(session, "GET", validate_weibo_login_url(login_url),
+                            timeout=15, allowed_hosts=WEIBO_LOGIN_HOSTS)
         except (requests.RequestException, ValueError) as exc:
             raise HTTPException(502, f"完成微博登录失败：{safe_exc(exc)}") from exc
 
@@ -500,10 +509,10 @@ def _cache_weibo_avatar(session, avatar_url: str, uid: str = "") -> str:
         return ""
 
     try:
-        response = session.get(
-            avatar_url,
+        # 头像地址与其重定向目标都过出站守卫（拒绝私网/保留段），逐跳校验
+        response = guarded_request(
+            session, "GET", avatar_url,
             timeout=15,
-            allow_redirects=True,
             headers={
                 "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                 "Referer": "https://m.weibo.cn/",
@@ -533,7 +542,7 @@ def _cache_weibo_avatar(session, avatar_url: str, uid: str = "") -> str:
         temporary.write_bytes(content)
         temporary.replace(target)
         return f"/data/avatars/{target.name}"
-    except (AttributeError, OSError, requests.RequestException) as exc:
+    except (AttributeError, OSError, ValueError, requests.RequestException) as exc:
         log.warning("微博头像下载失败（%s）：%s", avatar_url, exc)
         return ""
 
