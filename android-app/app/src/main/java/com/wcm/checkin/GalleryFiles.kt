@@ -7,7 +7,7 @@ import android.provider.DocumentsContract
 /**
  * 图库数据源（v0.4.0）：枚举 SAF 相册目录里的图片文件。
  *
- * - 过滤口径：mime 为 image/* 直接收；mime 缺失或是八进制流时按扩展名兜底
+ * - 过滤口径：mime 为 image 前缀直接收；mime 缺失或是八进制流时按扩展名兜底
  *   （SAF 创建的 jpg/gif 都带正确 mime，外部文件靠扩展名兜住）；
  * - 排序口径：文件名降序 = 最新在前（抓取文件名 yyyyMMdd_HHmmss_作者_序号）。
  * 过滤与排序是纯函数，随 CI 做 JVM 单测。
