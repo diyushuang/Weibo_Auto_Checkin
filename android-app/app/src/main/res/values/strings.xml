@@ -12,8 +12,7 @@
     <string name="log_empty">（暂无日志）</string>
 
     <!-- 首页 -->
-    <string name="home_summary_empty">还没有账号，点「＋ 添加账号」用微博官方页面登录</string>
-    <string name="home_summary_fmt">%1$d 个账号 · 面板同步：%2$s · 后台每 6 小时保活</string>
+    <string name="home_summary_empty">还没有账号，点「＋ 添加账号」用微博官方页面登录</string>    <string name="home_summary_fmt">%1$d 个账号 · 面板同步：%2$s · 后台每 6 小时保活</string>
     <string name="home_panel_ok">已配置</string>
     <string name="home_panel_off">未配置</string>
     <string name="home_account_empty">点右上「＋ 添加账号」开始</string>
@@ -65,5 +64,35 @@
     <string name="settings_behavior_title">行为</string>
     <string name="settings_live_gif">Live Photo 转 GIF（关闭则保存原始视频）</string>
     <string name="settings_about_title">关于</string>
-    <string name="settings_about_body">微博签到 App v%1$s\n真机签到 · 登录态同步 · 原图抓取\n权限：仅 INTERNET</string>
+    <string name="settings_about_body">微博签到 App v%1$s\n真机签到 · 登录态同步 · 原图抓取 · 图库预览\n权限：仅 INTERNET</string>
+
+    <!-- 图库（v0.4.0） -->
+    <string name="gallery_card_title">图库预览</string>
+    <string name="gallery_count_none">目录里还没有图片（抓取后在此浏览）</string>
+    <string name="gallery_count_fmt">%1$d 张图片</string>
+    <string name="gallery_open">打开图库</string>
+    <string name="gallery_need_dir">请先选择相册目录</string>
+    <string name="gallery_browse_title">图库</string>
+    <string name="gallery_empty">目录里还没有图片\n先在下方配置目标并开始抓取</string>
+    <string name="gallery_refresh">刷新</string>
+    <string name="gallery_item_desc">图片</string>
+    <string name="preview_share">分享</string>
+    <string name="preview_share_fail">没有可用的分享目标</string>
+    <string name="preview_open">系统打开</string>
+    <string name="preview_open_fail">没有应用能打开该图片</string>
+    <string name="preview_delete">删除</string>
+    <string name="preview_delete_title">删除这张图片?</string>
+    <string name="preview_delete_msg">将从相册目录删除，无法恢复。</string>
+    <string name="preview_delete_fail">删除失败（文件可能正被占用）</string>
+    <string name="preview_index_fmt">%1$d / %2$d</string>
+    <string name="preview_load_fail">目录里没有图片</string>
+
+    <!-- 超话状态 / 补签（v0.4.0） -->
+    <string name="home_row_hint">点按查看超话签到状态 / 补签</string>
+    <string name="home_topic_title">%1$s 的超话</string>
+    <string name="home_topic_none">该账号没有关注超话</string>
+    <string name="home_topic_all_done">共 %1$d 个超话，今日已全部签到 ✓</string>
+    <string name="home_topic_pick">已签 %1$d / 共 %2$d。勾选待签超话进行补签：</string>
+    <string name="home_topic_resign">补签选中</string>
+    <string name="home_resign_done_fmt">补签完成：%1$d 成功 / %2$d 失败</string>
 </resources>

@@ -26,5 +26,15 @@
         <activity
             android:name=".LoginWebViewActivity"
             android:exported="false" />
+
+        <!-- 图库（v0.4.0）：网格浏览与全屏预览，均为内部页面 -->
+        <activity
+            android:name=".GalleryBrowseActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ImagePreviewActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Wcm.Preview" />
     </application>
 </manifest>

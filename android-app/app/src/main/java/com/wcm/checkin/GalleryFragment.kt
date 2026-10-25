@@ -58,6 +58,7 @@ class GalleryFragment : Fragment() {
         view.findViewById<View>(R.id.btnSinglePost).setOnClickListener { pickSinglePost() }
         view.findViewById<View>(R.id.btnCrawlStart).setOnClickListener { start() }
         view.findViewById<View>(R.id.btnCrawlStop).setOnClickListener { crawlJob?.cancel() }
+        view.findViewById<View>(R.id.btnOpenGallery).setOnClickListener { openGallery() }
 
         val switchAuto = view.findViewById<MaterialSwitch>(R.id.switchCrawlAuto)
         switchAuto.isChecked = AccountStore.crawlAuto(requireContext())
@@ -67,6 +68,7 @@ class GalleryFragment : Fragment() {
 
         renderDir()
         renderTargets()
+        refreshGalleryCount()
         view.findViewById<TextView>(R.id.crawlLog).text = logBuffer
     }
 
@@ -75,6 +77,7 @@ class GalleryFragment : Fragment() {
         if (!hidden && isAdded) {
             renderDir()
             renderTargets()
+            refreshGalleryCount()
         }
     }
 
@@ -91,6 +94,43 @@ class GalleryFragment : Fragment() {
             raw
         }
         view?.findViewById<TextView>(R.id.tvDirPath)?.text = display
+    }
+
+    // ---------- 图库（v0.4.0） ----------
+
+    private fun openGallery() {
+        val ctx = requireContext()
+        val raw = AccountStore.crawlTreeUri(ctx)
+        if (raw.isEmpty()) {
+            toast(getString(R.string.gallery_need_dir))
+            return
+        }
+        GalleryBrowseActivity.start(ctx, raw)
+    }
+
+    /** 图库卡计数：目录不可读/为空显示空态文案。 */
+    private fun refreshGalleryCount() {
+        val ctx = requireContext()
+        val raw = AccountStore.crawlTreeUri(ctx)
+        val tv = view?.findViewById<TextView>(R.id.tvGalleryCount) ?: return
+        if (raw.isEmpty()) {
+            tv.text = getString(R.string.gallery_count_none)
+            return
+        }
+        val resolver = ctx.contentResolver
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val count = try {
+                GalleryFiles.listImages(resolver, Uri.parse(raw)).size
+            } catch (e: Exception) {
+                -1
+            }
+            withContext(Dispatchers.Main) {
+                tv.text = when {
+                    count <= 0 -> getString(R.string.gallery_count_none)
+                    else -> getString(R.string.gallery_count_fmt, count)
+                }
+            }
+        }
     }
 
     private fun renderTargets() {
@@ -204,6 +244,7 @@ class GalleryFragment : Fragment() {
                     busy = false
                     view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = true
                     view?.findViewById<View>(R.id.btnAddTarget)?.isEnabled = true
+                    refreshGalleryCount()
                 }
             }
         }
@@ -312,6 +353,7 @@ class GalleryFragment : Fragment() {
                 busy = false
                 view?.findViewById<View>(R.id.btnCrawlStart)?.isEnabled = true
                 view?.findViewById<View>(R.id.btnSinglePost)?.isEnabled = true
+                refreshGalleryCount()
             }
         }
     }

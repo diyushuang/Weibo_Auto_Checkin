@@ -15,4 +15,13 @@
              夜间在 values-night/themes.xml 覆写为浅色图标。 -->
         <item name="android:windowLightStatusBar">true</item>
     </style>
+
+    <!-- 全屏图片预览：纯黑沉浸背景，状态栏图标恒为浅色（日夜两态都覆盖）。 -->
+    <style name="Theme.Wcm.Preview">
+        <item name="android:windowBackground">#FF000000</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">
+            shortEdges
+        </item>
+    </style>
 </resources>
